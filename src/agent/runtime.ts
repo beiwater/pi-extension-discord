@@ -527,6 +527,7 @@ export class BotRuntime {
 					this.beginAssistantActivity(now);
 					this.running = true;
 					this.runStartTs = now;
+					this.lastTurnFailed = false;
 					this.providerCallsInRun = 0;
 					this.lastLlmRunId = null;
 					this.lastUsageRun = null;
@@ -557,7 +558,10 @@ export class BotRuntime {
 							.map((c) => (c as { thinking: string }).thinking)
 							.join("\n");
 						if (thinking.trim()) this.recordEvent("thinking", { text: thinking });
-						if (msg.usage) this.recordUsage(msg.usage, now);
+						// Failed attempts carry zero usage; recording them would create empty llm_runs
+						// rows, consume this turn's input metrics, and mark the eventual success as a
+						// tool follow-up round.
+						if (msg.usage && !this.lastTurnFailed) this.recordUsage(msg.usage, now);
 					}
 					break;
 				}
@@ -907,14 +911,7 @@ export class BotRuntime {
 			const created = createReplyObligation(this.db, this.bot.id, routingTrigger.chatId, routingTrigger.messageId);
 			directReplyPending = true;
 			directReplyMessageId = routingTrigger.messageId;
-			const alreadyRecorded = this.db
-				.query(
-					"SELECT 1 FROM agent_events WHERE bot_id = ? AND kind = 'reply_obligation_created' AND json_extract(payload, '$.message_id') = ? LIMIT 1",
-				)
-				.get(this.bot.id, routingTrigger.messageId);
-			if (created || !alreadyRecorded) {
-				this.recordEvent("reply_obligation_created", { message_id: routingTrigger.messageId });
-			}
+			if (created) this.recordEvent("reply_obligation_created", { message_id: routingTrigger.messageId });
 		}
 		const state = this.samplingState();
 		if (state === "stopping") return "skipped_stopping";
@@ -1162,7 +1159,11 @@ export class BotRuntime {
 			provider_calls: this.providerCallsInRun,
 		});
 		const activeState = contextStateFromEntries(this.session.sessionManager.buildContextEntries(), highWater);
-		const deliveredObligationIds = delivered.map((obligation) => obligation.messageId);
+		// Pi resolves the turn normally after exhausting retries; the batch is in context but the
+		// model never answered, so a direct address stays owed and re-enters the next flush as a
+		// mandatory event instead of being marked delivered.
+		const turnFailed = this.lastTurnFailed;
+		const deliveredObligationIds = turnFailed ? [] : delivered.map((obligation) => obligation.messageId);
 		if (deliveredObligationIds.length > 0) {
 			this.session.sessionManager.appendCustomEntry(TELEGRAM_CONTEXT_COMMIT_TYPE, {
 				consumedSeq: highWater,
@@ -1179,6 +1180,13 @@ export class BotRuntime {
 		});
 		this.visibleMessageIds = activeState.visible;
 		await this.maybeAutoCompact();
+		if (turnFailed) {
+			for (const obligation of delivered) {
+				this.recordEvent("reply_obligation_retained", { message_id: obligation.messageId });
+			}
+			// Pi already spent the retry budget; do not loop straight back into the provider.
+			return false;
+		}
 		for (const obligation of delivered) {
 			this.recordEvent("reply_obligation_delivered", { message_id: obligation.messageId });
 		}
@@ -1236,16 +1244,14 @@ export class BotRuntime {
 			return;
 		}
 		try {
-			const usage = this.session.getContextUsage();
-			const piTokens = usage?.tokens ?? 0;
+			// Pi already ran its token-threshold compaction inside the turn; the only signal it
+			// cannot see is image transport bytes.
 			const entries = this.session.sessionManager.buildContextEntries();
 			const imageBytes = contextImageBytes(entries, join(this.config.dataDir, "media"));
-			if (piTokens <= this.bot.compactionThreshold && imageBytes <= this.bot.contextImageBudgetBytes) return;
+			if (imageBytes <= this.bot.contextImageBudgetBytes) return;
 			log.info("agent_runtime", "auto_compact_triggered", {
 				bot_id: this.bot.id,
-				pi_tokens: piTokens,
 				image_bytes: imageBytes,
-				threshold: this.bot.compactionThreshold,
 				image_budget: this.bot.contextImageBudgetBytes,
 			});
 			// The before-compact handler charges retained images against keepRecentTokens, so a

@@ -145,6 +145,56 @@ test("name-keyword direct address gets the same obligation guarantee", async () 
 	expect(obligationCount(db)).toBe(0);
 });
 
+test("a provider turn that ends in error keeps the direct-address obligation and records no usage", async () => {
+	// Pi resolves the turn normally after exhausting retries (final assistant stopReason
+	// "error"). Production 429s then marked @mentions delivered without any reply and wrote
+	// one zero-usage llm_runs row per failed attempt.
+	const { rt, db, sent } = setup();
+	const messageId = 1006;
+	insertMessage(db, messageId, "hello @bot");
+	const session = (rt as any).session;
+	const send = session.sendCustomMessage;
+	const failedTurn = {
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [],
+			stopReason: "error",
+			errorMessage: "429: quota",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+		},
+	};
+	let events: ((event: unknown) => void) | null = null;
+	session.subscribe = (listener: (event: unknown) => void) => {
+		events = listener;
+	};
+	(rt as any).subscribeEvents();
+	session.sendCustomMessage = async (message: unknown) => {
+		await send(message);
+		events?.({ type: "agent_start" });
+		events?.(failedTurn);
+		events?.({ type: "agent_settled" });
+	};
+	expect(rt.trigger("explicit", { reason: "explicit", chatId: CHAT_ID, messageId })).toBe("started");
+	await (rt as any).flushPromise;
+	expect(sent).toHaveLength(1);
+	expect(obligationCount(db)).toBe(1);
+	expect((db.query("SELECT COUNT(*) count FROM llm_runs").get() as { count: number }).count).toBe(0);
+	// The next trigger re-packs the owed message as a mandatory event and a healthy turn clears it.
+	session.sendCustomMessage = async (message: unknown) => {
+		await send(message);
+		events?.({ type: "agent_start" });
+		events?.({ ...failedTurn, message: { ...failedTurn.message, stopReason: "stop" } });
+		events?.({ type: "agent_settled" });
+	};
+	expect(rt.trigger("explicit")).toBe("started");
+	await (rt as any).flushPromise;
+	expect(sent).toHaveLength(2);
+	expect(sent[1]).toContain(`#${messageId}`);
+	expect(obligationCount(db)).toBe(0);
+	expect((db.query("SELECT COUNT(*) count FROM llm_runs").get() as { count: number }).count).toBe(1);
+});
+
 test("already-visible messages never create a duplicate obligation", () => {
 	const { rt, db } = setup();
 	const messageId = 1003;
@@ -229,7 +279,9 @@ test("post-turn compaction replaces durable and in-memory visibility together", 
 	const { rt, db } = setup();
 	insertMessage(db, 9010, "hello");
 	const session = (rt as any).session;
-	session.getContextUsage = () => ({ tokens: 40000, contextWindow: 65536 });
+	// Pi owns the token threshold inside the turn; the post-turn hook only reacts to image
+	// transport pressure, so force that path.
+	(rt as any).bot.contextImageBudgetBytes = -1;
 	session.compact = async () => {
 		const marker = session.sessionManager.appendCustomEntry("retained_marker", {});
 		session.sessionManager.appendCompaction("summary", marker, 40000, { visibleMessageIds: [] });

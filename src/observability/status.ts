@@ -142,33 +142,52 @@ function formatContextBreakdown(view: BotStatusView, visual: boolean): string {
 	const window = view.usage.context.contextWindow;
 	if (!breakdown || window <= 0) return "—";
 	const parts = [
-		["S", "🟥", "system prompt", breakdown.system],
-		["T", "🟪", "tool desc", breakdown.tools],
-		["C", "🟫", "compacted history", breakdown.compactedHistory],
-		["M", "🟦", "message", breakdown.messages],
-		[
-			"F",
-			"🟩",
-			"free",
-			Math.max(0, window - breakdown.system - breakdown.tools - breakdown.compactedHistory - breakdown.messages),
-		],
-	] as const;
-	const values = parts.map(([short, square, label, tokens]) => ({
-		short,
-		square,
-		label,
-		tokens,
-		percentage: `${((tokens / window) * 100).toFixed(1)}%`,
-	}));
+		{ short: "S", square: "🟥", label: "system prompt", tokens: breakdown.system },
+		{ short: "T", square: "🟪", label: "tool desc", tokens: breakdown.tools },
+		{ short: "C", square: "🟫", label: "compacted history", tokens: breakdown.compactedHistory },
+		{ short: "M", square: "🟦", label: "message", tokens: breakdown.messages },
+		{
+			short: "F",
+			square: "🟩",
+			label: "free",
+			tokens: Math.max(
+				0,
+				window - breakdown.system - breakdown.tools - breakdown.compactedHistory - breakdown.messages,
+			),
+		},
+	];
+	const tenths = largestRemainderTenths(
+		parts.map(({ tokens }) => tokens),
+		window,
+	);
+	const values = parts.map((part, index) => ({ ...part, percentage: `${(tenths[index]! / 10).toFixed(1)}%` }));
 	if (!visual) return values.map(({ short, percentage }) => `${short} ${percentage}`).join(" · ");
 	const bar = values.map(({ square, tokens }) => square.repeat(Math.round(tokens / 1024))).join("");
 	// No fenced code block: the emoji bar and the per-line emoji markers stay as plain text so
 	// they render in color, while only the label/percentage column is inline-code (monospace).
 	// Every legend line starts with exactly one emoji, so the inline-code spans all align.
+	// System/tool rows are hidden when 0 (no system prompt or tools in this payload).
 	return [
 		bar,
-		...values.map(({ square, label, percentage }) => `${square} \`${label.padEnd(17)}${percentage.padStart(6)}\``),
+		...values
+			.filter(({ short, tokens }) => tokens > 0 || (short !== "S" && short !== "T"))
+			.map(({ square, label, percentage }) => `${square} \`${label.padEnd(17)}${percentage.padStart(6)}\``),
 	].join("\n");
+}
+
+/** Percentages in tenths of a percent that sum exactly to 1000 (largest remainder). */
+function largestRemainderTenths(tokens: readonly number[], total: number): number[] {
+	const exact = tokens.map((value) => (value * 1000) / total);
+	const floored = exact.map((value) => Math.floor(value));
+	let remainder = 1000 - floored.reduce((sum, value) => sum + value, 0);
+	const order = exact
+		.map((value, index) => ({ index, fraction: value - Math.floor(value) }))
+		.sort((left, right) => right.fraction - left.fraction || left.index - right.index);
+	for (const { index } of order) {
+		if (remainder-- <= 0) break;
+		floored[index]!++;
+	}
+	return floored;
 }
 
 function currentContextBreakdown(view: BotStatusView): ContextBreakdown | null {
@@ -205,8 +224,12 @@ function duration(value: number | null | undefined): string {
 	return `${(value / 1000).toFixed(1)} s`;
 }
 
+/** Local-time `YYYY-MM-DD HH:MM:SS`, matching the attached-feed cards (production TZ is Asia/Singapore). */
 function time(value: number | null | undefined): string {
-	return value == null ? "—" : new Date(value).toISOString();
+	if (value == null) return "—";
+	const date = new Date(value);
+	const pad = (part: number) => String(part).padStart(2, "0");
+	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${date.toLocaleTimeString("en-GB", { hour12: false })}`;
 }
 
 function formatContext(context: BotUsageSummary["context"]): string {

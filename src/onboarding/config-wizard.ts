@@ -82,10 +82,17 @@ export async function runNativeConfigWizard(
 	const typedPath = join(rootDir, "telegram.config.ts");
 	const envPath = join(rootDir, ".env");
 	let existing: ReturnType<typeof readExistingConfigSource> | null = null;
-	try {
-		existing = readExistingConfigSource(rootDir);
-	} catch {
-		// Missing and unreadable defaults are handled by the protected-file branch below.
+	if (existsSync(typedPath)) {
+		try {
+			existing = readExistingConfigSource(rootDir);
+		} catch (error) {
+			// A present but unreadable/non-regular source is a real failure, not "no config".
+			ui.notify(
+				formatSafeFailure("Existing configuration could not be read", error, "No files were changed."),
+				"error",
+			);
+			return { outcome: "failed" };
+		}
 	}
 
 	let mode: OnboardingWriteMode = "create";
@@ -139,7 +146,7 @@ export async function runNativeConfigWizard(
 		);
 		if (!confirmed) return cancelled(ui);
 		mode = "backup-replace";
-	} else if (existsSync(typedPath) || existsSync(envPath)) {
+	} else if (existsSync(envPath)) {
 		const action = await ui.select("Partial or ambiguous Telegram configuration found", [
 			WIZARD_ACTION_REPLACE,
 			WIZARD_ACTION_CANCEL,

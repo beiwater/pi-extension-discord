@@ -12,7 +12,7 @@ import {
 	type TextSendApi,
 } from "../telegram/send.ts";
 
-export const TELEGRAM_TEXT_MAX_CHARS = 4096;
+const TELEGRAM_TEXT_MAX_CHARS = 4096;
 const REQUEST_ID_MAX = 128;
 const REQUEST_CACHE_MAX = 256;
 

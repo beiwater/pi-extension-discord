@@ -4,7 +4,7 @@
 
 import type { Database } from "bun:sqlite";
 import { log } from "../observability/log.ts";
-import { convertToPng, type ModelRuntime, resizeImage } from "@earendil-works/pi-coding-agent";
+import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { contentText, type AssistantMessage, type Context } from "@earendil-works/pi-ai";
 import type { BotApi } from "../telegram/api.ts";
 import { parsePiModelReference } from "../agent/model-ref.ts";
@@ -13,27 +13,15 @@ import {
 	PiModelConfigurationError,
 	type PiProviderFailureCategory,
 } from "../agent/model-runtime.ts";
-import {
-	bytesBucket,
-	dedupeInFlight,
-	ensureLocalMedia,
-	isVideoMedia,
-	isVisionMedia,
-	staticMediaMimeForPath,
-	type LocalMediaFailure,
-	type MediaBytesBucket,
-	type MediaDownloadApi,
-} from "./local-cache.ts";
+import { bytesBucket, dedupeInFlight, isVideoMedia, isVisionMedia, type MediaBytesBucket } from "./local-cache.ts";
 import { appendMediaUpdateEvents } from "../db/message-events.ts";
 import type { VisionScheduler } from "./vision-scheduler.ts";
 import {
-	extractVideoFrames,
-	inspectVideoTranscoder,
-	type VideoFrameInput,
-	type VideoFrameResult,
-	type VideoFrameOutcome,
-	type VideoTranscoderAvailability,
-} from "./video-frames.ts";
+	prepareMediaImages,
+	type PreparedImageMime,
+	type PrepareMediaImagesFailure,
+	type PrepareMediaImagesOptions,
+} from "./prepare-images.ts";
 
 export { fileIdForBot } from "./local-cache.ts";
 
@@ -53,16 +41,8 @@ export type VisionBytesBucket = MediaBytesBucket | "gte_512_kib";
 export type VisionOutcome =
 	| "ok"
 	| "empty_response"
-	| "unsupported_format"
-	| "conversion_failed"
-	| "file_id_unavailable"
-	| "telegram_file_unavailable"
-	| "telegram_download_failed"
-	| "media_unavailable"
-	| "empty_file"
-	| "download_oversize"
 	| "media_download_aborted"
-	| VideoFrameOutcome
+	| Exclude<PrepareMediaImagesFailure, "aborted">
 	| PiProviderFailureCategory;
 
 export interface VisionTelemetry {
@@ -86,7 +66,7 @@ export interface VisionDescriptionResult {
 
 export interface VisionImageInput {
 	bytes: Uint8Array;
-	mimeType: "image/jpeg" | "image/png" | "image/webp" | "image/gif";
+	mimeType: PreparedImageMime;
 	position?: number;
 }
 
@@ -108,29 +88,13 @@ export interface VisionExecutor {
 export type VisionUpdateSink = (fileUniqueId: string, text: string) => void;
 export type VisionTelemetrySink = (telemetry: VisionTelemetry) => void;
 
-export interface EnsureVisionOptions {
+export interface EnsureVisionOptions extends PrepareMediaImagesOptions {
 	/** Called exactly after a new non-empty description is persisted; cache hits do not emit. */
 	onPersist?: VisionUpdateSink;
 	/** Receives bounded aggregate fields only; never identity, path, prompt, or response text. */
 	onTelemetry?: VisionTelemetrySink;
-	/** Deterministic test seam; production uses data/media under cwd. */
-	cacheDir?: string;
-	/** Deterministic latency seam. */
-	monotonicNow?: () => number;
 	/** Shared deployment-wide provider gate; cache/local work remains outside the queue. */
 	scheduler?: VisionScheduler;
-	/** Lets a routed bot reuse media received through another configured bot without crossing file_id ownership. */
-	botApis?: ReadonlyMap<string, MediaDownloadApi>;
-	/** Deterministic extraction seam; production uses ffprobe + ffmpeg. */
-	extractFrames?: (input: VideoFrameInput) => Promise<VideoFrameResult>;
-	/** Startup snapshot: missing optional tools skip before Telegram download and never block chat. */
-	videoTranscoder?: VideoTranscoderAvailability;
-}
-
-interface PiVisionExecutorOptions {
-	convert?: typeof convertToPng;
-	resize?: typeof resizeImage;
-	monotonicNow?: () => number;
 }
 
 type VisionModelRuntime = Pick<ModelRuntime, "getModel" | "completeSimple">;
@@ -156,43 +120,35 @@ function emptyTelemetry(kind: VisionKind, outcome: VisionOutcome, latencyMs: num
 function usageTelemetry(
 	kind: VisionKind,
 	sourceBytes: number,
-	convertedBytes: number | null,
+	convertedBytes: number,
 	latencyMs: number,
 	outcome: VisionOutcome,
-	message?: AssistantMessage,
-	frames?: number,
-	providerCalled = false,
+	message: AssistantMessage | undefined,
+	frames: number,
 ): VisionTelemetry {
 	return {
 		kind,
 		sourceBytesBucket: bytesBucket(sourceBytes, "gte_512_kib"),
-		convertedBytesBucket: convertedBytes == null ? "unavailable" : bytesBucket(convertedBytes, "gte_512_kib"),
+		convertedBytesBucket: bytesBucket(convertedBytes, "gte_512_kib"),
 		latencyMs: Math.max(0, Math.round(latencyMs)),
 		inputTokens: boundedNumber(message?.usage.input),
 		outputTokens: boundedNumber(message?.usage.output),
 		reasoningTokens: boundedNumber(message?.usage.reasoning),
 		cost: boundedNumber(message?.usage.cost.total),
 		outcome,
-		...(frames == null ? {} : { frames }),
-		...(providerCalled ? { providerCalled: true } : {}),
+		frames,
+		providerCalled: true,
 	};
 }
 
 /** Create a lightweight vision adapter over the already-owned Pi runtime/auth snapshot. */
-export function createPiVisionExecutor(
-	runtime: VisionModelRuntime,
-	modelRef: string,
-	options: PiVisionExecutorOptions = {},
-): VisionExecutor {
+export function createPiVisionExecutor(runtime: VisionModelRuntime, modelRef: string): VisionExecutor {
 	const selection = parsePiModelReference(modelRef);
 	if (!selection) {
 		throw new Error("invalid auxiliary_visual_model; expected provider/model:effort");
 	}
 	const model = runtime.getModel(selection.provider, selection.model);
 	const readinessFailure = !model ? "unknown_model" : !model.input.includes("image") ? "image_input_unsupported" : null;
-	const convert = options.convert ?? convertToPng;
-	const resize = options.resize ?? resizeImage;
-	const monotonicNow = options.monotonicNow ?? (() => performance.now());
 
 	return {
 		modelRef: selection.canonical,
@@ -200,54 +156,15 @@ export function createPiVisionExecutor(
 		model: selection.model,
 		readinessFailure,
 		async describe(input): Promise<VisionDescriptionResult> {
-			const startedAt = monotonicNow();
+			const startedAt = performance.now();
 			const sourceBytes = input.sourceBytes;
-
-			const images: Array<{ data: string; mimeType: string; position?: number }> = [];
-			let convertedBytes = 0;
-			let converted = input.kind === "video";
-			for (const source of input.images) {
-				let bytes: Uint8Array = source.bytes;
-				let mimeType: string = source.mimeType;
-				if (source.mimeType === "image/webp" || source.mimeType === "image/gif") {
-					try {
-						const convertedImage = await convert(Buffer.from(bytes).toString("base64"), source.mimeType);
-						if (!convertedImage) throw new Error("conversion failed");
-						bytes = new Uint8Array(Buffer.from(convertedImage.data, "base64"));
-						mimeType = convertedImage.mimeType;
-						converted = true;
-					} catch {
-						return {
-							text: null,
-							telemetry: usageTelemetry(
-								input.kind,
-								sourceBytes,
-								converted ? convertedBytes : null,
-								monotonicNow() - startedAt,
-								"conversion_failed",
-								undefined,
-								input.images.length,
-							),
-						};
-					}
-				}
-				if (input.kind !== "video") {
-					// Video frames are already bounded by ffmpeg scale=1280; only static images need a cap.
-					// A resize failure falls back to the original image rather than failing the description.
-					const resized = await resize(bytes, mimeType).catch(() => null);
-					if (resized) {
-						bytes = new Uint8Array(Buffer.from(resized.data, "base64"));
-						mimeType = resized.mimeType;
-						converted = converted || resized.wasResized;
-					}
-				}
-				convertedBytes += bytes.byteLength;
-				images.push({
-					data: Buffer.from(bytes).toString("base64"),
-					mimeType,
-					...(source.position == null ? {} : { position: source.position }),
-				});
-			}
+			// Images arrive already converted/resized by prepareMediaImages; only encode them here.
+			const convertedBytes = input.images.reduce((total, image) => total + image.bytes.byteLength, 0);
+			const images = input.images.map((image) => ({
+				data: Buffer.from(image.bytes).toString("base64"),
+				mimeType: image.mimeType,
+				...(image.position == null ? {} : { position: image.position }),
+			}));
 
 			const prompt =
 				input.kind === "video"
@@ -278,6 +195,16 @@ export function createPiVisionExecutor(
 					},
 				],
 			};
+			const telemetry = (outcome: VisionOutcome, message?: AssistantMessage): VisionTelemetry =>
+				usageTelemetry(
+					input.kind,
+					sourceBytes,
+					convertedBytes,
+					performance.now() - startedAt,
+					outcome,
+					message,
+					input.images.length,
+				);
 			let message: AssistantMessage;
 			try {
 				// Single timeout layer: the SDK enforces VISION_TIMEOUT_MS inside completeSimple.
@@ -289,53 +216,16 @@ export function createPiVisionExecutor(
 					timeoutMs: VISION_TIMEOUT_MS,
 				});
 			} catch (error) {
-				return {
-					text: null,
-					telemetry: usageTelemetry(
-						input.kind,
-						sourceBytes,
-						converted ? convertedBytes : null,
-						monotonicNow() - startedAt,
-						classifyPiProviderFailure(error),
-						undefined,
-						input.images.length,
-						true,
-					),
-				};
+				return { text: null, telemetry: telemetry(classifyPiProviderFailure(error)) };
 			}
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				const category = classifyPiProviderFailure(new Error(message.errorMessage ?? message.stopReason));
-				return {
-					text: null,
-					telemetry: usageTelemetry(
-						input.kind,
-						sourceBytes,
-						converted ? convertedBytes : null,
-						monotonicNow() - startedAt,
-						category,
-						message,
-						input.images.length,
-						true,
-					),
-				};
+				return { text: null, telemetry: telemetry(category, message) };
 			}
 
 			const text = contentText(message.content).trim();
-			const outcome: VisionOutcome = text ? "ok" : "empty_response";
-			return {
-				text: text || null,
-				telemetry: usageTelemetry(
-					input.kind,
-					sourceBytes,
-					converted ? convertedBytes : null,
-					monotonicNow() - startedAt,
-					outcome,
-					message,
-					input.images.length,
-					true,
-				),
-			};
+			return { text: text || null, telemetry: telemetry(text ? "ok" : "empty_response", message) };
 		},
 	};
 }
@@ -356,7 +246,7 @@ export function ensureVision(
 	botId: string,
 	fileUniqueId: string,
 	executor: VisionExecutor,
-	options: EnsureVisionOptions = {},
+	options: EnsureVisionOptions,
 ): Promise<string | null> {
 	return dedupeInFlight(inFlightByDb, db, fileUniqueId, () =>
 		ensureVisionInner(db, api, botId, fileUniqueId, executor, options),
@@ -371,11 +261,6 @@ function emitTelemetry(options: EnsureVisionOptions, telemetry: VisionTelemetry)
 	}
 }
 
-function localMediaVisionOutcome(outcome: LocalMediaFailure): VisionOutcome {
-	if (outcome === "aborted") return "media_download_aborted";
-	return outcome;
-}
-
 async function ensureVisionInner(
 	db: Database,
 	api: BotApi,
@@ -384,8 +269,7 @@ async function ensureVisionInner(
 	executor: VisionExecutor,
 	options: EnsureVisionOptions,
 ): Promise<string | null> {
-	const monotonicNow = options.monotonicNow ?? (() => performance.now());
-	const startedAt = monotonicNow();
+	const startedAt = performance.now();
 	const media = db.query("SELECT kind, mime, vision FROM media WHERE file_unique_id = ?").get(fileUniqueId) as {
 		kind: string;
 		mime: string | null;
@@ -399,19 +283,25 @@ async function ensureVisionInner(
 		return cached.text?.trim() || null;
 	}
 	if (video) {
-		const transcoder =
-			options.videoTranscoder ?? (options.extractFrames ? { ffmpeg: true, ffprobe: true } : inspectVideoTranscoder());
-		if (!transcoder.ffmpeg || !transcoder.ffprobe) {
-			emitTelemetry(options, emptyTelemetry(kind, "video_transcoder_unavailable", monotonicNow() - startedAt));
+		if (!options.videoTranscoder.ffmpeg || !options.videoTranscoder.ffprobe) {
+			emitTelemetry(options, emptyTelemetry(kind, "video_transcoder_unavailable", performance.now() - startedAt));
 			return null;
 		}
 		if (options.scheduler) {
 			return options.scheduler.schedule(() =>
-				ensureVisionPrepared(db, api, botId, fileUniqueId, executor, options, media, video, kind, startedAt, true),
+				ensureVisionPrepared(db, api, botId, fileUniqueId, executor, options, media.kind, kind, startedAt, true),
 			);
 		}
 	}
-	return ensureVisionPrepared(db, api, botId, fileUniqueId, executor, options, media, video, kind, startedAt, false);
+	return ensureVisionPrepared(db, api, botId, fileUniqueId, executor, options, media.kind, kind, startedAt, false);
+}
+
+/** Only outcomes that cannot change on retry are cached; ffmpeg/provider/transport failures retry later. */
+function persistUnsupported(db: Database, fileUniqueId: string, kind: VisionKind, outcome: VisionOutcome): void {
+	db.query("UPDATE media SET vision = ? WHERE file_unique_id = ?").run(
+		JSON.stringify({ model: "none", kind, text: null, unsupported: true, outcome, at: Date.now() }),
+		fileUniqueId,
+	);
 }
 
 async function ensureVisionPrepared(
@@ -421,79 +311,37 @@ async function ensureVisionPrepared(
 	fileUniqueId: string,
 	executor: VisionExecutor,
 	options: EnsureVisionOptions,
-	media: { kind: string; mime: string | null; vision: string | null },
-	initialVideo: boolean,
+	mediaKind: string,
 	initialKind: VisionKind,
 	startedAt: number,
 	providerSlotReserved: boolean,
 ): Promise<string | null> {
-	const monotonicNow = options.monotonicNow ?? (() => performance.now());
-	let video = initialVideo;
-	let kind = initialKind;
-	const local = await ensureLocalMedia(db, api, botId, fileUniqueId, {
-		cacheDir: options.cacheDir,
-		botApis: options.botApis,
-	});
-	if (!local.ok) {
-		const outcome = localMediaVisionOutcome(local.outcome);
-		if (outcome === "unsupported_format") {
-			db.query("UPDATE media SET vision = ? WHERE file_unique_id = ?").run(
-				JSON.stringify({ model: "none", kind, text: null, unsupported: true, outcome, at: Date.now() }),
-				fileUniqueId,
-			);
-		}
-		emitTelemetry(options, emptyTelemetry(kind, outcome, monotonicNow() - startedAt));
+	const prepared = await prepareMediaImages(db, api, botId, fileUniqueId, options);
+	if (!prepared.ok) {
+		const outcome: VisionOutcome = prepared.outcome === "aborted" ? "media_download_aborted" : prepared.outcome;
+		if (outcome === "unsupported_format") persistUnsupported(db, fileUniqueId, initialKind, outcome);
+		emitTelemetry(options, emptyTelemetry(initialKind, outcome, performance.now() - startedAt));
 		return null;
 	}
-	if (!video && media.kind === "sticker" && local.mimeType.startsWith("video/")) {
-		video = true;
-		kind = "video";
-	}
-
-	let images: VisionImageInput[];
-	if (video) {
-		const prepared = await (options.extractFrames ?? extractVideoFrames)({
-			sourcePath: local.sourcePath,
-			sourceBytes: local.bytes,
-			sourceExtension: local.sourceExtension,
-		});
-		if (!prepared.ok) {
-			if (prepared.outcome !== "video_transcoder_unavailable") {
-				db.query("UPDATE media SET vision = ? WHERE file_unique_id = ?").run(
-					JSON.stringify({ model: "none", kind, text: null, outcome: prepared.outcome, at: Date.now() }),
-					fileUniqueId,
-				);
-			}
-			emitTelemetry(
-				options,
-				usageTelemetry(kind, local.bytes.byteLength, null, monotonicNow() - startedAt, prepared.outcome),
-			);
-			return null;
-		}
-		images = prepared.frames;
-	} else {
-		if (!staticMediaMimeForPath(`source.${local.sourceExtension}`)) {
-			emitTelemetry(options, emptyTelemetry(kind, "unsupported_format", monotonicNow() - startedAt));
-			return null;
-		}
-		images = [{ bytes: local.bytes, mimeType: local.mimeType as VisionImageInput["mimeType"] }];
-	}
+	const kind: VisionKind = prepared.kind === "video" ? "video" : initialKind;
 
 	const describe = () =>
 		executor.describe({
 			kind,
-			sourceBytes: local.bytes.byteLength,
-			images,
-			...(video && media.kind === "sticker" ? { videoSticker: true } : {}),
+			sourceBytes: prepared.sourceBytes,
+			images: prepared.images,
+			...(kind === "video" && mediaKind === "sticker" ? { videoSticker: true } : {}),
 		});
 	const result: VisionDescriptionResult =
 		options.scheduler && !providerSlotReserved ? await options.scheduler.schedule(describe) : await describe();
 	const text = result.text?.trim() || null;
-	db.query("UPDATE media SET vision = ? WHERE file_unique_id = ?").run(
-		JSON.stringify({ model: executor.modelRef, kind, text, outcome: result.telemetry.outcome, at: Date.now() }),
-		fileUniqueId,
-	);
-	if (text) appendMediaUpdateEvents(db, fileUniqueId, text);
+	if (text) {
+		db.query("UPDATE media SET vision = ? WHERE file_unique_id = ?").run(
+			JSON.stringify({ model: executor.modelRef, kind, text, outcome: result.telemetry.outcome, at: Date.now() }),
+			fileUniqueId,
+		);
+		appendMediaUpdateEvents(db, fileUniqueId, text);
+	}
 	emitTelemetry(options, result.telemetry);
 	if (text && options.onPersist) {
 		try {

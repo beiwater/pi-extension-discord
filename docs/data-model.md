@@ -49,6 +49,8 @@
 
 - `(bot_id, chat_id) → consumed_seq`，表示业务消费到的 `message_events` high-water。
 - cursor 只单调前进；compaction、visibility replacement 与 epoch 轮换不得回退它。
+- daemon 启动删除不在当前配置中的 bot id 的 cursor 与 `reply_obligations` 行：retention 以配置 bot 的 `MIN(consumed_seq)` 为界，失效 id 不得永久钉住它。
+- `messages`/`message_events` 的 trigger 以 `CREATE TRIGGER IF NOT EXISTS` 建立；修改 trigger body 时 `migrate()` 必须先 `DROP TRIGGER`，否则旧库不会更新。
 
 ### bot_visible_messages
 

@@ -62,8 +62,8 @@ export class IpcServer {
 		sockPath: string,
 		botNames: Map<string, string>,
 		botUserIds: Map<string, number>,
-		private readonly manualSend: ManualSendHandler | null = null,
-		private readonly runtimeSnapshot: RuntimeSnapshotProvider | null = null,
+		private readonly manualSend: ManualSendHandler,
+		private readonly runtimeSnapshot: RuntimeSnapshotProvider,
 	) {
 		this.db = db;
 		this.sockPath = sockPath;
@@ -185,68 +185,54 @@ export class IpcServer {
 		if (existsSync(this.sockPath)) rmSync(this.sockPath);
 	}
 
-	/** Push a live item to all attached TUIs, honoring per-listener filters. */
-	broadcast(item: TimelineItem): void {
-		if (this.listeners.size === 0) return;
-		const frame = encodeFrame({ type: "append", item } satisfies ServerMessage);
+	/**
+	 * Listeners that completed hello and observe `botId` (null = bot-agnostic frame). A global
+	 * listener sees every bot; a filtered listener only its own.
+	 */
+	private listenersFor(botId: string | null): SocketLike[] {
+		const targets: SocketLike[] = [];
 		for (const socket of this.listeners) {
 			if (!this.filters.has(socket)) continue;
 			const filter = this.filters.get(socket) ?? null;
-			if (filter && item.kind === "evt" && item.botId !== filter) continue;
-			this.writeFrame(socket, frame);
+			if (botId == null || !filter || filter === botId) targets.push(socket);
 		}
+		return targets;
+	}
+
+	private broadcastTo(botId: string | null, message: ServerMessage): void {
+		const targets = this.listenersFor(botId);
+		if (targets.length === 0) return;
+		const frame = encodeFrame(message);
+		for (const socket of targets) this.writeFrame(socket, frame);
+	}
+
+	/** Push a live item to attached TUIs; group messages are shared, agent events follow the bot filter. */
+	broadcast(item: TimelineItem): void {
+		this.broadcastTo(item.kind === "evt" ? item.botId : null, { type: "append", item });
 	}
 
 	/** Push a live usage run (REQ-UI-0003 R2), honoring per-listener filters. */
 	broadcastUsage(run: UsageRun): void {
-		if (this.listeners.size === 0) return;
-		const frame = encodeFrame({ type: "usage", run } satisfies ServerMessage);
-		for (const socket of this.listeners) {
-			if (!this.filters.has(socket)) continue;
-			const filter = this.filters.get(socket) ?? null;
-			if (filter && run.botId !== filter) continue;
-			this.writeFrame(socket, frame);
-		}
+		this.broadcastTo(run.botId, { type: "usage", run });
 	}
 
 	/** Push one shared media description to every live transcript (REQ-UI-0006). */
 	broadcastVision(update: VisionUpdate): void {
-		if (this.listeners.size === 0) return;
-		const frame = encodeFrame({ type: "vision_update", ...update } satisfies ServerMessage);
-		for (const socket of this.listeners) {
-			if (this.filters.has(socket)) this.writeFrame(socket, frame);
-		}
+		this.broadcastTo(null, { type: "vision_update", ...update });
 	}
 
 	/** Push one owner-only local media path to every live transcript (REQ-UI-0014). */
 	broadcastMediaReady(update: MediaReadyUpdate): void {
-		if (this.listeners.size === 0) return;
-		const frame = encodeFrame({ type: "media_ready", ...update } satisfies ServerMessage);
-		for (const socket of this.listeners) {
-			if (this.filters.has(socket)) this.writeFrame(socket, frame);
-		}
+		this.broadcastTo(null, { type: "media_ready", ...update });
 	}
 
 	/** Push an ephemeral assistant snapshot only to listeners observing its bot. */
 	broadcastStream(stream: AgentStreamFrame): void {
-		if (this.listeners.size === 0) return;
-		const targets = [...this.listeners].filter((socket) => {
-			if (!this.filters.has(socket)) return false;
-			const filter = this.filters.get(socket) ?? null;
-			return !filter || filter === stream.botId;
-		});
-		if (targets.length === 0) return;
-		const frame = encodeFrame({ type: "agent_stream", stream } satisfies ServerMessage);
-		for (const socket of targets) this.writeFrame(socket, frame);
+		this.broadcastTo(stream.botId, { type: "agent_stream", stream });
 	}
 
 	hasStreamListener(botId: string): boolean {
-		for (const socket of this.listeners) {
-			if (!this.filters.has(socket)) continue;
-			const filter = this.filters.get(socket) ?? null;
-			if (!filter || filter === botId) return true;
-		}
-		return false;
+		return this.listenersFor(botId).length > 0;
 	}
 
 	private handleRequest(socket: SocketLike, req: ClientRequest): void {
@@ -284,27 +270,17 @@ export class IpcServer {
 
 	private async handleManualSend(socket: SocketLike, request: SendMessageRequest): Promise<void> {
 		let result: SendMessageResult;
-		if (!this.manualSend) {
+		try {
+			result = await this.manualSend(request);
+		} catch (error) {
+			log.error("ipc", "manual_send_failed", { category: errorCategory(error) });
 			result = {
 				requestId: typeof request.requestId === "string" ? request.requestId : "",
 				botId: typeof request.botId === "string" ? request.botId : "",
 				ok: false,
-				code: "service_unavailable",
-				error: "manual Telegram sending is unavailable",
+				code: "internal_error",
+				error: "manual Telegram send failed internally",
 			};
-		} else {
-			try {
-				result = await this.manualSend(request);
-			} catch (error) {
-				log.error("ipc", "manual_send_failed", { category: errorCategory(error) });
-				result = {
-					requestId: typeof request.requestId === "string" ? request.requestId : "",
-					botId: typeof request.botId === "string" ? request.botId : "",
-					ok: false,
-					code: "internal_error",
-					error: "manual Telegram send failed internally",
-				};
-			}
 		}
 		// The request may finish after the client disconnects. Persistence/broadcast remains
 		// valid, but there is no ACK destination and the client must treat that as unknown.
@@ -414,7 +390,7 @@ export class IpcServer {
 		out.lastId = maxId.m;
 		for (const botId of bots) {
 			out.bots[botId] = loadBotStats(this.db, botId);
-			const status = this.runtimeSnapshot?.(botId);
+			const status = this.runtimeSnapshot(botId);
 			if (status) out.statuses[botId] = status;
 		}
 		return out;

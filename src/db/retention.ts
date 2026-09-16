@@ -11,8 +11,22 @@ export interface RetentionResult {
 }
 
 /**
- * Apply bounded local retention. Provider events are removed only after every known bot cursor
- * for the chat consumed them, and never while a direct-reply obligation still references them.
+ * Drop per-bot consumption state of bots no longer configured. A renamed/removed bot would
+ * otherwise pin `MIN(consumed_seq)` and its obligations forever, freezing event retention.
+ */
+export function pruneUnconfiguredBotState(db: Database, botIds: readonly string[]): number {
+	const placeholders = botIds.map(() => "?").join(", ");
+	const prune = db.transaction(
+		(): number =>
+			db.query(`DELETE FROM bot_cursors WHERE bot_id NOT IN (${placeholders})`).run(...botIds).changes +
+			db.query(`DELETE FROM reply_obligations WHERE bot_id NOT IN (${placeholders})`).run(...botIds).changes,
+	);
+	return prune();
+}
+
+/**
+ * Apply bounded local retention. Provider events are removed only after every configured bot
+ * cursor for the chat consumed them, and never while a direct-reply obligation still references them.
  */
 export function applyRetention(db: Database, config: RetentionConfig, now = Date.now()): RetentionResult {
 	const telemetryCutoffMs = now - config.telemetryDays * DAY_MS;

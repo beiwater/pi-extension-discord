@@ -12,14 +12,8 @@ import {
 	type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
 
-export interface ConfigurableModelRuntime {
-	getModel(providerId: string, modelId: string): Model<Api> | undefined;
-	hasConfiguredAuth(providerId: string): boolean;
-	getProviderAuthStatus?(providerId: string): {
-		configured: boolean;
-		source?: string;
-	};
-}
+/** The subset of Pi's ModelRuntime the daemon reads; Pi 0.84.1 always provides all three. */
+export type ConfigurableModelRuntime = Pick<ModelRuntime, "getModel" | "hasConfiguredAuth" | "getProviderAuthStatus">;
 
 export type PiModelConfigurationCategory =
 	| "runtime_unavailable"
@@ -76,11 +70,8 @@ export function inspectModelReasoning(model: Model<Api>, requested: ModelThinkin
 	};
 }
 
-/** Select a Pi-owned model/auth pair without reading or injecting credential material. */
-export async function configureBotModelRuntime<T extends ConfigurableModelRuntime>(
-	bot: PiModelSelection,
-	runtime: T,
-): Promise<T> {
+/** Validate a Pi-owned model/auth pair without reading or injecting credential material. */
+export function assertBotModelConfigured(bot: PiModelSelection, runtime: ConfigurableModelRuntime): void {
 	const model = runtime.getModel(bot.provider, bot.model);
 	if (!model) {
 		throw new PiModelConfigurationError("unknown_model", bot.provider, bot.model, undefined, bot.purpose);
@@ -100,7 +91,6 @@ export async function configureBotModelRuntime<T extends ConfigurableModelRuntim
 	if (!runtime.hasConfiguredAuth(bot.provider)) {
 		throw new PiModelConfigurationError("unauthenticated_provider", bot.provider, bot.model, undefined, bot.purpose);
 	}
-	return runtime;
 }
 
 /**
@@ -155,7 +145,7 @@ export async function createSharedModelRuntime(
 			detail || undefined,
 		);
 	}
-	for (const bot of bots) await configureBotModelRuntime(bot, runtime);
+	for (const bot of bots) assertBotModelConfigured(bot, runtime);
 	return runtime;
 }
 
@@ -163,7 +153,7 @@ export type PiAuthSource = "stored" | "environment" | "configured";
 
 /** Return only Pi's fixed non-sensitive auth source category. */
 export function piAuthSource(runtime: ConfigurableModelRuntime, provider: string): PiAuthSource {
-	const status = runtime.getProviderAuthStatus?.(provider);
+	const status = runtime.getProviderAuthStatus(provider);
 	if (status?.configured && (status.source === "stored" || status.source === "environment")) return status.source;
 	return "configured";
 }

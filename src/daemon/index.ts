@@ -24,7 +24,7 @@ import { reconcileMediaCachePaths } from "../media/local-cache.ts";
 import { composeDeployment, composePollers } from "./composition.ts";
 import type { IngestResult } from "../telegram/ingest.ts";
 import { claimRoutingDecision, finishRoutingClaim } from "../db/routing-claims.ts";
-import { applyRetention } from "../db/retention.ts";
+import { applyRetention, pruneUnconfiguredBotState } from "../db/retention.ts";
 import { log } from "../observability/log.ts";
 import { inspectVideoTranscoder } from "../media/video-frames.ts";
 import { pruneUnreferencedMediaCache } from "../media/lifecycle.ts";
@@ -34,7 +34,7 @@ const config = loadConfig(rootDir);
 // Exclusive pid lock at the EARLIEST moment, before any slow init (getMe / model runtime /
 // session creation): a second `start` while we're still initializing must not race us
 // (REQ-OPS-0001 R4). Released on shutdown; stale pid files are taken over.
-const pidFd = acquirePidLock(config.dataDir);
+acquirePidLock(config.dataDir);
 const videoTranscoder = inspectVideoTranscoder();
 // Frame sampling matters in both media modes: vision descriptions and context-mode image blocks.
 const mediaNeedsFrames = config.vision.enabled || config.media.mode === "context";
@@ -90,7 +90,7 @@ const { sharedModelRuntime, sharedVisionExecutor } = await (async () => {
 		if (executor) assertPiVisionExecutorReady(executor);
 		return { sharedModelRuntime: runtime, sharedVisionExecutor: executor };
 	} catch (error) {
-		releasePidLock(pidFd, config.dataDir);
+		releasePidLock(config.dataDir);
 		throw error;
 	}
 })();
@@ -101,6 +101,11 @@ const mediaPathReconciliation = reconcileMediaCachePaths(db, mediaDir);
 if (mediaPathReconciliation.migrated > 0 || mediaPathReconciliation.invalidated > 0) {
 	log.info("media_cache", "paths_reconciled", mediaPathReconciliation);
 }
+const unconfiguredRows = pruneUnconfiguredBotState(
+	db,
+	config.bots.map((bot) => bot.id),
+);
+if (unconfiguredRows > 0) log.info("daemon", "unconfigured_bot_state_pruned", { rows: unconfiguredRows });
 function runRetentionMaintenance(): void {
 	const retention = applyRetention(db, config.retention);
 	if (Object.values(retention).some((count) => count > 0)) {
@@ -181,7 +186,7 @@ const broadcastMessageRow = (chatId: number, messageId: number): MessageRow | nu
 	if (row) ipc.broadcast(ipc.msgToItem(row));
 	return row;
 };
-const manualSend = new ManualSendService(db, Number(`-100${config.groupPeerId}`), botApis, ({ chatId, messageId }) => {
+const manualSend = new ManualSendService(db, config.groupChatId, botApis, ({ chatId, messageId }) => {
 	broadcastMessageRow(chatId, messageId);
 });
 ipc = new IpcServer(
@@ -205,14 +210,15 @@ const mediaCache = new MediaCacheQueue(db, botApis, {
 	},
 });
 for (const [botId, rt] of runtimes) {
-	rt.eventSink = (kind, payload) => {
+	rt.eventSink = (event) => {
 		ipc.broadcast({
 			kind: "evt",
-			ts: Date.now(),
+			ts: event.ts,
+			evtId: event.id,
 			botId,
 			botName: botNames.get(botId) ?? botId,
-			evtKind: kind,
-			payload: JSON.stringify(payload),
+			evtKind: event.kind,
+			payload: JSON.stringify(event.payload),
 		});
 	};
 	rt.sentMessageSink = (rawMsg) => {
@@ -250,18 +256,6 @@ const telegramControlCoordinator = new TelegramControlCoordinator(
 		broadcastMessageRow(chatId, messageId);
 	},
 );
-const controlTasks = new Set<Promise<unknown>>();
-function runTelegramControl(command: NonNullable<ReturnType<typeof parseTelegramControlCommand>>): void {
-	const task = telegramControlCoordinator.handle(command).catch(() => {
-		log.error("telegram_control", "coordinator_failed", {
-			bot_id: command.replyBotId,
-			message_id: command.messageId,
-			category: "local_failure",
-		});
-	});
-	controlTasks.add(task);
-	void task.finally(() => controlTasks.delete(task));
-}
 void publishTelegramControlMenus(botApis);
 
 // Direct replies are durable response opportunities. Restore them only after each
@@ -272,12 +266,7 @@ for (const [botId, rt] of runtimes) {
 }
 
 // route an ingested group message to a bot per routing rules
-function route(result: IngestResult): void {
-	if (result.chatId == null || result.messageId == null) return;
-	const row = db
-		.query("SELECT * FROM messages WHERE chat_id = ? AND message_id = ?")
-		.get(result.chatId, result.messageId) as MessageRow | null;
-	if (!row) return; // missing row; is_bot is enforced inside routeMessageDecision
+function route(result: IngestResult, row: MessageRow): void {
 	const decision = routeMessageDecision(db, row, identities, {
 		secret: config.routerSecret ?? "",
 		probs: config.bots.map((b) => b.routingP),
@@ -325,25 +314,30 @@ function route(result: IngestResult): void {
 	}
 }
 
-const pollers = composePollers(db, config, (result, update, botId) => {
+// Routing and control both run inside the poller's durable handoff: the pending dispatch is
+// only deleted after this handler returns, so a crash before claim/handle replays the update.
+const pollers = composePollers(db, config, async (result, update, botId) => {
 	log.info("telegram_ingest", "update_committed", {
 		bot_id: botId,
 		kind: result.kind,
 		chat_id: result.chatId,
 		message_id: result.messageId,
 	});
+	if (result.chatId == null || result.messageId == null) return;
+	const row = db
+		.query("SELECT * FROM messages WHERE chat_id = ? AND message_id = ?")
+		.get(result.chatId, result.messageId) as MessageRow | null;
+	if (!row) return;
 	const command = parseTelegramControlCommand(update, botId, identities);
-	if (command) runTelegramControl(command);
-	else route(result);
-	if (result.chatId != null && result.messageId != null) {
-		const row = broadcastMessageRow(result.chatId, result.messageId);
-		// Poller offset + canonical row are durable before this non-blocking side effect.
-		if (row) mediaCache.scheduleMessage(botId, row);
-	}
+	if (command) await telegramControlCoordinator.handle(command);
+	else route(result, row);
+	ipc.broadcast(ipc.msgToItem(row));
+	// Poller offset + canonical row are durable before this non-blocking side effect.
+	mediaCache.scheduleMessage(botId, row);
 });
 
 let stopping = false;
-async function shutdown(signal: string) {
+async function shutdown(signal: string, exitCode = 0) {
 	if (stopping) return;
 	stopping = true;
 	log.info("daemon", "shutdown_started", { signal });
@@ -369,17 +363,14 @@ async function shutdown(signal: string) {
 		}
 	}
 	await mediaCacheStop;
-	if (controlTasks.size > 0) {
-		await Promise.race([Promise.allSettled([...controlTasks]), new Promise((resolve) => setTimeout(resolve, 5_000))]);
-	}
 	ipc.stop();
-	releasePidLock(pidFd, config.dataDir);
+	releasePidLock(config.dataDir);
 	// wait for the poller loops to actually exit; stop() aborts any in-flight long
 	// poll or backoff sleep, so this returns promptly inside the hard shutdown bound
 	await Promise.allSettled([pollerRuns]);
 	db.close();
 	clearTimeout(hardTimer);
-	process.exit(0);
+	process.exit(exitCode);
 }
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 process.on("SIGINT", () => void shutdown("SIGINT"));
@@ -387,5 +378,7 @@ process.on("SIGINT", () => void shutdown("SIGINT"));
 // Publish the readiness socket only after synchronous startup work and signal handlers are ready.
 ipc.start();
 log.info("daemon", "ready", { pid: process.pid, group_peer_id: config.groupPeerId, bot_count: config.bots.length });
+// A fatal poller error (revoked token) must still run the graceful shutdown so other bots'
+// in-flight turns settle and the pid file/socket are released.
 const pollerRuns = Promise.all(pollers.map((p) => p.run()));
-await pollerRuns;
+await pollerRuns.catch(() => shutdown("poller_fatal", 1));

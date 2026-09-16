@@ -9,13 +9,6 @@ export interface PiModelDefaults {
 	thinkingLevel: ThinkingLevel;
 }
 
-export interface PiSettingsReader {
-	getDefaultProvider(): string | undefined;
-	getDefaultModel(): string | undefined;
-	getDefaultThinkingLevel(): ThinkingLevel | undefined;
-	drainErrors(): Array<{ scope: "global" | "project" }>;
-}
-
 export class PiSettingsConfigurationError extends Error {
 	readonly category = "invalid_settings" as const;
 
@@ -28,12 +21,8 @@ export class PiSettingsConfigurationError extends Error {
 }
 
 /** Read Pi's merged global/project defaults without copying or exposing credential data. */
-export function loadPiModelDefaults(
-	projectRoot: string,
-	agentDir = getAgentDir(),
-	createSettings: (root: string, dir: string) => PiSettingsReader = (root, dir) => SettingsManager.create(root, dir),
-): PiModelDefaults {
-	const settings = createSettings(projectRoot, agentDir);
+export function loadPiModelDefaults(projectRoot: string, agentDir = getAgentDir()): PiModelDefaults {
+	const settings = SettingsManager.create(projectRoot, agentDir);
 	const loadErrors = settings.drainErrors();
 	if (loadErrors.length > 0) {
 		throw new PiSettingsConfigurationError([...new Set(loadErrors.map((error) => error.scope))]);

@@ -1,6 +1,7 @@
 // Normalize a Telegram message object into our canonical message row.
 // See docs/data-model.md. Grammar for LLM serialization lives elsewhere (Phase 3).
 
+import { stickerMime } from "../media/sticker-catalog.ts";
 import { normalizeRichMessage, RICH_MESSAGE_UNAVAILABLE } from "./rich-message.ts";
 
 export interface CanonicalMessage {
@@ -37,12 +38,6 @@ export interface MediaInfo {
 	height?: number;
 	sticker_set?: string;
 	sticker_emoji?: string;
-}
-
-function stickerMime(sticker: { is_animated?: boolean; is_video?: boolean }): string {
-	if (sticker.is_video) return "video/webm";
-	if (sticker.is_animated) return "application/x-tgsticker";
-	return "image/webp";
 }
 
 export function normalizeMessage(msg: any, editDate: number | null = null): CanonicalMessage {
@@ -107,15 +102,6 @@ function extractMedia(msg: any): MediaInfo | null {
 		}
 	}
 	return null;
-}
-
-/** True if this update's message belongs to the configured group. */
-export function isTargetChat(chatId: number, groupPeerId: number): boolean {
-	if (chatId === groupPeerId) return true;
-	if (chatId === -groupPeerId) return true;
-	// supergroup/channel id form: -100<peerId>
-	if (chatId === Number(`-100${groupPeerId}`)) return true;
-	return false;
 }
 
 /** Extract the message-bearing payload from an update, or null. */

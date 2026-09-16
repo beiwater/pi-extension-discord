@@ -115,7 +115,7 @@ export async function main(args = process.argv.slice(2), rootDir = process.cwd()
 		const pid = readPid(join(config.dataDir, "daemon.pid"));
 		const report = buildDebugReport(db, {
 			botIds,
-			chatId: Number(`-100${config.groupPeerId}`),
+			chatId: config.groupChatId,
 			sinceMs,
 			logs: readStructuredLogTail(join(config.dataDir, "daemon.log")),
 			daemon: { pid, alive: pid != null && pidAlive(pid), socket: existsSync(join(config.dataDir, "daemon.sock")) },

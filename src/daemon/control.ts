@@ -33,12 +33,75 @@ export interface DaemonControlResult {
 	logTail?: string;
 }
 
+/** Exact readiness line printed by start/restart; the Pi extension keys on it. */
+export const DAEMON_READY_MESSAGE = "daemon ready";
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /** Process lifecycle shared by CLI start/restart/status/stop. */
 export class DaemonController {
-	private readonly port: ReturnType<typeof createNodeDaemonControlPort>;
+	private readonly dataDir: string;
+	private readonly pidPath: string;
+	private readonly sockPath: string;
+	private readonly logPath: string;
+	private readonly lockPath: string;
 
-	constructor(rootDir: string) {
-		this.port = createNodeDaemonControlPort(rootDir);
+	constructor(private readonly rootDir: string) {
+		this.dataDir = join(rootDir, "data");
+		this.pidPath = join(this.dataDir, "daemon.pid");
+		this.sockPath = join(this.dataDir, "daemon.sock");
+		this.logPath = join(this.dataDir, "daemon.log");
+		this.lockPath = join(this.dataDir, "daemon.control.lock");
+	}
+
+	private readPid(): number | null {
+		return readPid(this.pidPath);
+	}
+	private pidFileExists(): boolean {
+		return existsSync(this.pidPath);
+	}
+	private socketExists(): boolean {
+		return existsSync(this.sockPath);
+	}
+	private removePidFile(): void {
+		rmSync(this.pidPath, { force: true });
+	}
+	private removeSocket(): void {
+		rmSync(this.sockPath, { force: true });
+	}
+	private isOurDaemon(pid: number): boolean {
+		return isOurDaemon(pid, this.rootDir);
+	}
+	private listOurDaemons(): number[] {
+		return listOurDaemons(this.rootDir);
+	}
+	/** The pid may exit between the liveness check and this signal; ESRCH is the desired end state. */
+	private signal(pid: number): void {
+		try {
+			process.kill(pid, "SIGTERM");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+		}
+	}
+	private spawnDaemon(): number {
+		mkdirSync(this.dataDir, { recursive: true });
+		rotateLogFile(this.logPath);
+		const logFd = openSync(this.logPath, "a", 0o600);
+		try {
+			const child = spawn("bun", ["run", join(this.rootDir, "src/daemon/index.ts")], {
+				cwd: this.rootDir,
+				detached: true,
+				stdio: ["ignore", logFd, logFd],
+			});
+			child.once("error", () => {
+				/* readiness polling reports the bounded startup failure */
+			});
+			if (child.pid == null) throw new Error("daemon child has no pid");
+			child.unref();
+			return child.pid;
+		} finally {
+			closeSync(logFd);
+		}
 	}
 
 	async start(): Promise<DaemonControlResult> {
@@ -46,8 +109,8 @@ export class DaemonController {
 	}
 
 	status(): DaemonControlResult {
-		const pid = this.port.readPid();
-		const discovered = this.port.listOurDaemons();
+		const pid = this.readPid();
+		const discovered = this.listOurDaemons();
 		if (pid == null) {
 			if (discovered.length > 0)
 				return {
@@ -59,7 +122,7 @@ export class DaemonController {
 				};
 			return { ok: false, state: "stopped", lines: ["daemon not running"] };
 		}
-		if (!this.port.pidAlive(pid)) {
+		if (!pidAlive(pid)) {
 			if (discovered.length > 0)
 				return {
 					ok: false,
@@ -69,15 +132,15 @@ export class DaemonController {
 						`pid file points to dead pid ${pid}, but project daemon process(es) ${discovered.join(", ")} remain; run restart to recover`,
 					],
 				};
-			this.port.removePidFile();
-			if (this.port.socketExists()) this.port.removeSocket();
+			this.removePidFile();
+			if (this.socketExists()) this.removeSocket();
 			return {
 				ok: false,
 				state: "stopped",
 				lines: [`removed stale daemon state for dead pid ${pid}`, "daemon not running"],
 			};
 		}
-		if (!this.port.isOurDaemon(pid)) {
+		if (!this.isOurDaemon(pid)) {
 			return {
 				ok: false,
 				state: "failed",
@@ -100,25 +163,25 @@ export class DaemonController {
 	}
 
 	stop(): DaemonControlResult {
-		const pid = this.port.readPid();
-		const discovered = this.port.listOurDaemons();
-		if (pid != null && this.port.pidAlive(pid) && !this.port.isOurDaemon(pid)) {
+		const pid = this.readPid();
+		const discovered = this.listOurDaemons();
+		if (pid != null && pidAlive(pid) && !this.isOurDaemon(pid)) {
 			return { ok: false, state: "failed", pid, lines: [`refusing to stop: pid ${pid} is not this project's daemon`] };
 		}
-		const targets = [...new Set([...discovered, ...(pid != null && this.port.pidAlive(pid) ? [pid] : [])])];
+		const targets = [...new Set([...discovered, ...(pid != null && pidAlive(pid) ? [pid] : [])])];
 		if (targets.length === 0) {
-			if (pid != null || this.port.pidFileExists()) this.port.removePidFile();
-			if (this.port.socketExists()) this.port.removeSocket();
+			if (pid != null || this.pidFileExists()) this.removePidFile();
+			if (this.socketExists()) this.removeSocket();
 			return {
 				ok: false,
 				state: "stopped",
 				lines: [...(pid == null ? [] : [`removed stale daemon state for dead pid ${pid}`]), "daemon not running"],
 			};
 		}
-		if (pid != null && !this.port.pidAlive(pid)) {
-			this.port.removePidFile();
+		if (pid != null && !pidAlive(pid)) {
+			this.removePidFile();
 		}
-		for (const target of targets) this.port.signal(target);
+		for (const target of targets) this.signal(target);
 		return {
 			ok: true,
 			state: "stopped",
@@ -128,12 +191,12 @@ export class DaemonController {
 	}
 
 	async restart(): Promise<DaemonControlResult> {
-		const lock = this.port.tryAcquireRestartLock();
+		const lock = tryAcquireControlLock(this.lockPath);
 		if (!lock) return { ok: false, state: "failed", lines: ["restart already in progress"] };
 		try {
 			const lines: string[] = [];
-			const pid = this.port.readPid();
-			if (pid == null && this.port.pidFileExists() && this.port.socketExists()) {
+			const pid = this.readPid();
+			if (pid == null && this.pidFileExists() && this.socketExists()) {
 				return {
 					ok: false,
 					state: "failed",
@@ -142,7 +205,7 @@ export class DaemonController {
 					],
 				};
 			}
-			if (pid != null && this.port.pidAlive(pid) && !this.port.isOurDaemon(pid)) {
+			if (pid != null && pidAlive(pid) && !this.isOurDaemon(pid)) {
 				return {
 					ok: false,
 					state: "failed",
@@ -150,27 +213,21 @@ export class DaemonController {
 					lines: [`refusing to restart: pid ${pid} is not this project's daemon`],
 				};
 			}
-			const targets = [
-				...new Set([...this.port.listOurDaemons(), ...(pid != null && this.port.pidAlive(pid) ? [pid] : [])]),
-			];
-			if (pid != null && !this.port.pidAlive(pid)) {
-				this.port.removePidFile();
+			const targets = [...new Set([...this.listOurDaemons(), ...(pid != null && pidAlive(pid) ? [pid] : [])])];
+			if (pid != null && !pidAlive(pid)) {
+				this.removePidFile();
 				lines.push(`removed stale daemon pid file for dead pid ${pid}`);
-			} else if (pid == null && this.port.pidFileExists()) {
-				this.port.removePidFile();
+			} else if (pid == null && this.pidFileExists()) {
+				this.removePidFile();
 				lines.push("removed malformed stale daemon pid file");
 			}
 			if (targets.length > 0) {
 				lines.push(`stopping old daemon pid(s) ${targets.join(", ")}`);
-				for (const target of targets) this.port.signal(target);
+				for (const target of targets) this.signal(target);
 				lines.push("waiting for every old daemon, pid file and socket to disappear");
-				const deadline = this.port.now() + DEFAULT_STOP_TIMEOUT_MS;
-				while (
-					targets.some((target) => this.port.pidAlive(target)) ||
-					this.port.pidFileExists() ||
-					this.port.socketExists()
-				) {
-					if (this.port.now() >= deadline) {
+				const deadline = Date.now() + DEFAULT_STOP_TIMEOUT_MS;
+				while (targets.some((target) => pidAlive(target)) || this.pidFileExists() || this.socketExists()) {
+					if (Date.now() >= deadline) {
 						return {
 							ok: false,
 							state: "failed",
@@ -181,11 +238,11 @@ export class DaemonController {
 							],
 						};
 					}
-					await this.port.sleep(DEFAULT_POLL_INTERVAL_MS);
+					await sleep(DEFAULT_POLL_INTERVAL_MS);
 				}
 			} else {
-				if (this.port.socketExists()) {
-					this.port.removeSocket();
+				if (this.socketExists()) {
+					this.removeSocket();
 					lines.push("removed stale daemon socket");
 				}
 			}
@@ -197,8 +254,8 @@ export class DaemonController {
 	}
 
 	private async startUnlocked(lines: string[]): Promise<DaemonControlResult> {
-		const existing = this.port.readPid();
-		if (existing == null && this.port.pidFileExists() && this.port.socketExists()) {
+		const existing = this.readPid();
+		if (existing == null && this.pidFileExists() && this.socketExists()) {
 			return {
 				ok: false,
 				state: "failed",
@@ -208,8 +265,8 @@ export class DaemonController {
 				],
 			};
 		}
-		if (existing != null && this.port.pidAlive(existing)) {
-			if (!this.port.isOurDaemon(existing)) {
+		if (existing != null && pidAlive(existing)) {
+			if (!this.isOurDaemon(existing)) {
 				return {
 					ok: false,
 					state: "failed",
@@ -224,7 +281,7 @@ export class DaemonController {
 				lines: [...lines, `daemon already running (pid ${existing})`],
 			};
 		}
-		const orphans = this.port.listOurDaemons();
+		const orphans = this.listOurDaemons();
 		if (orphans.length > 0) {
 			return {
 				ok: false,
@@ -235,43 +292,48 @@ export class DaemonController {
 				],
 			};
 		}
-		if (existing != null || this.port.pidFileExists()) {
-			this.port.removePidFile();
+		if (existing != null || this.pidFileExists()) {
+			this.removePidFile();
 			lines.push(
 				existing == null
 					? "removed malformed stale daemon pid file"
 					: `removed stale daemon pid file for dead pid ${existing}`,
 			);
 		}
-		if (this.port.socketExists()) {
-			this.port.removeSocket();
+		if (this.socketExists()) {
+			this.removeSocket();
 			lines.push("removed stale daemon socket");
 		}
 
 		let childPid: number;
 		try {
-			childPid = this.port.spawnDaemon();
+			childPid = this.spawnDaemon();
 		} catch {
 			return this.startFailure(lines, "failed to spawn daemon; logs: data/daemon.log");
 		}
-		const deadline = this.port.now() + DEFAULT_START_TIMEOUT_MS;
-		while (this.port.now() < deadline) {
-			const daemonPid = this.port.readPid();
+		const deadline = Date.now() + DEFAULT_START_TIMEOUT_MS;
+		while (Date.now() < deadline) {
+			const daemonPid = this.readPid();
 			if (
-				(await this.port.socketReady()) &&
+				(await connectUnixSocket(this.sockPath)) &&
 				daemonPid != null &&
-				this.port.pidAlive(daemonPid) &&
-				this.port.isOurDaemon(daemonPid)
+				pidAlive(daemonPid) &&
+				this.isOurDaemon(daemonPid)
 			) {
-				return { ok: true, state: "ready", pid: daemonPid, lines: [...lines, `daemon ready (pid ${daemonPid})`] };
+				return {
+					ok: true,
+					state: "ready",
+					pid: daemonPid,
+					lines: [...lines, `${DAEMON_READY_MESSAGE} (pid ${daemonPid})`],
+				};
 			}
-			if (!this.port.pidAlive(childPid))
+			if (!pidAlive(childPid))
 				return this.startFailure(lines, "daemon exited during startup; logs: data/daemon.log", childPid);
-			await this.port.sleep(DEFAULT_POLL_INTERVAL_MS);
+			await sleep(DEFAULT_POLL_INTERVAL_MS);
 		}
-		if (!this.port.pidAlive(childPid))
+		if (!pidAlive(childPid))
 			return this.startFailure(lines, "daemon exited during startup; logs: data/daemon.log", childPid);
-		const pid = this.port.readPid() ?? childPid;
+		const pid = this.readPid() ?? childPid;
 		return {
 			ok: true,
 			state: "starting",
@@ -281,7 +343,7 @@ export class DaemonController {
 	}
 
 	private startFailure(lines: string[], message: string, pid?: number): DaemonControlResult {
-		const logTail = redactDaemonLog(this.port.readLogTail());
+		const logTail = redactDaemonLog(readBoundedLogTail(this.logPath));
 		return {
 			ok: false,
 			state: "failed",
@@ -305,7 +367,7 @@ export function redactDaemonLog(input: string): string {
 		.slice(-4096);
 }
 
-export function tryAcquireControlLock(lockPath: string, ownerPid = process.pid): DaemonControlLock | null {
+function tryAcquireControlLock(lockPath: string, ownerPid = process.pid): DaemonControlLock | null {
 	mkdirSync(dirname(lockPath), { recursive: true });
 	const create = (): number => {
 		const fd = openSync(lockPath, "wx", 0o600);
@@ -388,56 +450,4 @@ function readBoundedLogTail(logPath: string): string {
 				/* already closed */
 			}
 	}
-}
-
-function createNodeDaemonControlPort(rootDir: string) {
-	const dataDir = join(rootDir, "data");
-	const pidPath = join(dataDir, "daemon.pid");
-	const sockPath = join(dataDir, "daemon.sock");
-	const logPath = join(dataDir, "daemon.log");
-	const lockPath = join(dataDir, "daemon.control.lock");
-	return {
-		now: () => Date.now(),
-		sleep: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
-		readPid: () => readPid(pidPath),
-		pidFileExists: () => existsSync(pidPath),
-		pidAlive,
-		isOurDaemon: (pid: number) => isOurDaemon(pid, rootDir),
-		listOurDaemons: () => listOurDaemons(rootDir),
-		socketExists: () => existsSync(sockPath),
-		removePidFile: () => rmSync(pidPath, { force: true }),
-		removeSocket: () => rmSync(sockPath, { force: true }),
-		// The pid may exit between the liveness check and this signal (TOCTOU); ESRCH means
-		// the target is already gone, which is the desired end state.
-		signal: (pid: number) => {
-			try {
-				process.kill(pid, "SIGTERM");
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-			}
-		},
-		spawnDaemon: () => {
-			mkdirSync(dataDir, { recursive: true });
-			rotateLogFile(logPath);
-			const logFd = openSync(logPath, "a", 0o600);
-			try {
-				const child = spawn("bun", ["run", join(rootDir, "src/daemon/index.ts")], {
-					cwd: rootDir,
-					detached: true,
-					stdio: ["ignore", logFd, logFd],
-				});
-				child.once("error", () => {
-					/* readiness polling reports the bounded startup failure */
-				});
-				if (child.pid == null) throw new Error("daemon child has no pid");
-				child.unref();
-				return child.pid;
-			} finally {
-				closeSync(logFd);
-			}
-		},
-		socketReady: () => connectUnixSocket(sockPath),
-		readLogTail: () => readBoundedLogTail(logPath),
-		tryAcquireRestartLock: () => tryAcquireControlLock(lockPath),
-	};
 }

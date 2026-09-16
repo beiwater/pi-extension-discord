@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -121,8 +121,7 @@ export async function extractVideoFrames(
 	const ffprobe = runner.which("ffprobe");
 	if (!ffmpeg || !ffprobe) return { ok: false, outcome: "video_transcoder_unavailable" };
 
-	const directory = mkdtempSync(join(tmpdir(), "pi-tg-video-"));
-	chmodSync(directory, 0o700);
+	const directory = mkdtempSync(join(tmpdir(), "pi-tg-video-")); // mkdtemp already creates 0700
 	try {
 		let sourcePath = input.sourcePath;
 		if (!sourcePath) {

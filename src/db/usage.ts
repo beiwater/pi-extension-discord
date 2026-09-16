@@ -32,7 +32,8 @@ export function loadBotStats(db: Database, botId: string): BotStats {
 			        COALESCE(SUM(send_samples), 0) sendSamples,
 			        MIN(ts) firstRunTs,
 			        COALESCE(SUM(cost), 0) cost,
-			        COALESCE(MAX(epoch), 0) epoch
+			        COALESCE(MAX(epoch), 0) epoch,
+			        COALESCE(MAX(id), 0) lastRunId
 			   FROM llm_runs WHERE bot_id = ?`,
 		)
 		.get(botId) as Omit<BotStats, "last">;

@@ -105,7 +105,8 @@ export function listReferencedMissingDisplayMediaIds(
 
 /**
  * Delete a bounded batch of reproducible local media after compaction visibility is committed.
- * Derived context images (media.context_files) are removed together with their source file.
+ * Derived context images (media.context_files) are removed together with their source file and
+ * the DB refs are cleared for every scanned row (unlink failures are counted, never retried).
  * Canonical messages, file-id mappings, short ids and vision results remain untouched.
  */
 export function pruneUnreferencedMediaCache(
@@ -134,25 +135,28 @@ export function pruneUnreferencedMediaCache(
 	);
 	const remove = options.remove ?? defaultRemove;
 	for (const row of rows) {
-		const derived = parseContextFileNames(row.contextFiles);
 		const path = row.localPath ? resolveMediaSourcePath(mediaDir, row.localPath) : null;
-		if (row.localPath && !path) {
-			// Clear the DB refs only after every derived file is actually gone; otherwise keep
-			// context_files so a later compaction retries the removal instead of orphaning files.
-			if (removeDerived(mediaDir, derived, remove, result)) clear.run(row.fileUniqueId, row.localPath);
-			result.stale++;
-			continue;
-		}
-		try {
-			if (path) {
-				const outcome = remove(path);
-				if (outcome === "deleted") result.deleted++;
+		if (path) {
+			try {
+				if (remove(path) === "deleted") result.deleted++;
 				else result.stale++;
+			} catch {
+				result.failed++;
 			}
-			if (removeDerived(mediaDir, derived, remove, result)) clear.run(row.fileUniqueId, row.localPath);
-		} catch {
-			result.failed++;
+		} else if (row.localPath) {
+			result.stale++;
 		}
+		for (const name of parseContextFileNames(row.contextFiles)) {
+			try {
+				remove(join(mediaDir, name));
+			} catch {
+				result.failed++;
+			}
+		}
+		// Refs are cleared even when an unlink failed: a file this process cannot delete would
+		// otherwise sit at the head of the rowid-ordered batch on every compaction and starve the
+		// rest. The leaked file is reported through `failed`; the identity stays re-downloadable.
+		clear.run(row.fileUniqueId, row.localPath);
 	}
 	return result;
 }
@@ -168,23 +172,4 @@ function parseContextFileNames(value: string | null): string[] {
 	} catch {
 		return [];
 	}
-}
-
-/** Returns true only when every derived file is gone (missing files count as gone). */
-function removeDerived(
-	mediaDir: string,
-	names: readonly string[],
-	remove: NonNullable<MediaPruneOptions["remove"]>,
-	result: MediaPruneResult,
-): boolean {
-	let allGone = true;
-	for (const name of names) {
-		try {
-			remove(join(mediaDir, name));
-		} catch {
-			result.failed++;
-			allGone = false;
-		}
-	}
-	return allGone;
 }

@@ -13,7 +13,7 @@ import {
 } from "../observability/status.ts";
 import { extractUpdateMessage } from "./normalize.ts";
 
-export const CONTROL_COMMAND_AUDIT_EVENT = "telegram_control";
+const CONTROL_COMMAND_AUDIT_EVENT = "telegram_control";
 
 const MAX_REPLY_CHARS = 3500;
 const MAX_LABEL_CHARS = 64;
@@ -164,9 +164,8 @@ function parseControlValue(parameter: "routing_p" | "cooldown_ms", raw: string):
 		const value = Number(raw);
 		return Number.isSafeInteger(value) ? value : null;
 	}
-	if (!/^(?:0(?:\.\d+)?|1(?:\.0+)?)$/.test(raw)) return null;
-	const value = Number(raw);
-	return Number.isFinite(value) ? value : null;
+	// The pattern only admits 0, 0.x and 1.0, so Number() is always finite here.
+	return /^(?:0(?:\.\d+)?|1(?:\.0+)?)$/.test(raw) ? Number(raw) : null;
 }
 
 export class TelegramControlCommandService {

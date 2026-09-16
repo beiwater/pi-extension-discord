@@ -18,11 +18,8 @@ import {
 const MEDIA_MAX_BYTES = 1024 * 1024;
 const SEND_ACK_TIMEOUT_MS = 15_000;
 const MAX_PENDING_SENDS = 32;
-const MAX_VISION_UPDATES = 256;
-const VISION_UPDATE_TTL_MS = 10 * 60 * 1000;
-const MAX_MEDIA_READY_UPDATES = 256;
-const MEDIA_READY_TTL_MS = 10 * 60 * 1000;
-const MAX_PENDING_USAGE = 256;
+const MAX_MEDIA_UPDATES = 256;
+const MEDIA_UPDATE_TTL_MS = 10 * 60 * 1000;
 const IMAGE_MIME: Record<string, string> = {
 	png: "image/png",
 	jpg: "image/jpeg",
@@ -72,22 +69,10 @@ export type TimelineEvent =
 	| { type: "vision"; fileUniqueId: string; text: string }
 	| { type: "media"; fileUniqueId: string; mediaPath: string }
 	| { type: "stream"; stream: AgentStreamFrame }
-	| { type: "status"; text: string }
 	| { type: "disconnected"; reason: string };
 
 export interface TimelineHooks {
 	onEvent(event: TimelineEvent): void;
-}
-
-export interface TimelinePort {
-	readonly filter: string | null;
-	readonly isConnected: boolean;
-	readonly hasMore: boolean;
-	readonly isLoadingOlder: boolean;
-	connect(): Promise<boolean>;
-	requestOlder(): boolean;
-	sendText(botId: string, text: string, requestId: string): Promise<SendMessageResult>;
-	dispose(): void;
 }
 
 interface PendingSend {
@@ -96,44 +81,118 @@ interface PendingSend {
 	timer: ReturnType<typeof setTimeout>;
 }
 
-interface CachedVisionUpdate {
-	text: string;
-	expiresAt: number;
-}
+/** Insertion-ordered map with a capacity bound and per-entry TTL; used for out-of-order media updates. */
+class BoundedTtlMap<V> {
+	private readonly entries = new Map<string, { value: V; expiresAt: number }>();
 
-interface CachedMediaReadyUpdate {
-	mediaPath: string;
-	expiresAt: number;
+	constructor(
+		private readonly max: number,
+		private readonly ttlMs: number,
+	) {}
+
+	get(key: string): V | undefined {
+		const entry = this.entries.get(key);
+		return entry && entry.expiresAt > Date.now() ? entry.value : undefined;
+	}
+
+	/** Returns false when the key already holds the same live value. */
+	set(key: string, value: V): boolean {
+		const now = Date.now();
+		for (const [existingKey, entry] of this.entries) if (entry.expiresAt <= now) this.entries.delete(existingKey);
+		const existing = this.entries.get(key);
+		if (existing?.value === value) return false;
+		if (!existing && this.entries.size >= this.max) {
+			const oldest = this.entries.keys().next().value as string | undefined;
+			if (oldest) this.entries.delete(oldest);
+		}
+		this.entries.delete(key);
+		this.entries.set(key, { value, expiresAt: now + this.ttlMs });
+		return true;
+	}
+
+	clear(): void {
+		this.entries.clear();
+	}
 }
 
 /** Dedupe key shared by the timeline client and the feed renderer. */
 export function itemKey(item: TimelineItem): string {
-	if (item.kind === "msg") return `m:${item.chatId}:${item.messageId}`;
-	return item.evtId != null ? `e:${item.evtId}` : `e?:${item.botId}:${item.ts}:${item.evtKind}:${item.payload}`;
+	return item.kind === "msg" ? `m:${item.chatId}:${item.messageId}` : `e:${item.evtId}`;
 }
 
-function cursorOf(item: TimelineItem): TimelineCursor | null {
-	if (item.kind === "msg") return { ts: item.ts, id: item.messageId, rank: 1 };
-	return item.evtId == null ? null : { ts: item.ts, id: item.evtId, rank: 0 };
+function cursorOf(item: TimelineItem): TimelineCursor {
+	return item.kind === "msg" ? { ts: item.ts, id: item.messageId, rank: 1 } : { ts: item.ts, id: item.evtId, rank: 0 };
 }
 
 function compareCursor(left: TimelineCursor, right: TimelineCursor): number {
 	return left.ts - right.ts || left.rank - right.rank || left.id - right.id;
 }
 
+function emptyBotStats(): BotStats {
+	return {
+		runs: 0,
+		contextTokens: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		cacheMiss: 0,
+		estimatedCacheRuns: 0,
+		outputTokens: 0,
+		speedOutputTokens: 0,
+		reasoningTokens: 0,
+		totalLatencyMs: 0,
+		latencySamples: 0,
+		totalThinkingMs: 0,
+		thinkingSamples: 0,
+		totalSendMs: 0,
+		sendSamples: 0,
+		firstRunTs: null,
+		cost: 0,
+		epoch: 0,
+		lastRunId: 0,
+		last: null,
+	};
+}
+
+/** Fold one live run into a bot's totals (docs/telemetry.md: compaction adds to totals, never replaces `last`). */
+function applyRun(stats: BotStats, run: UsageRun): void {
+	stats.runs++;
+	stats.contextTokens += run.contextTokens;
+	stats.cacheRead += run.cacheRead;
+	stats.cacheWrite += run.cacheWrite;
+	if (run.cacheEstimated) stats.estimatedCacheRuns++;
+	stats.cacheMiss += run.cacheMiss;
+	stats.outputTokens += run.outputTokens;
+	stats.reasoningTokens += run.reasoningTokens;
+	if (!run.compaction) {
+		stats.speedOutputTokens += run.outputTokens;
+		stats.totalThinkingMs += run.thinkingMs ?? 0;
+		stats.thinkingSamples++;
+		stats.last = run;
+	}
+	stats.totalSendMs += run.sendMs ?? 0;
+	stats.sendSamples += run.sendSamples ?? 0;
+	if (run.latencyMs != null) {
+		stats.totalLatencyMs += run.latencyMs;
+		stats.latencySamples++;
+	}
+	stats.cost += run.cost;
+	stats.epoch = Math.max(stats.epoch, run.epoch);
+	stats.lastRunId = Math.max(stats.lastRunId, run.id);
+	stats.firstRunTs = stats.firstRunTs == null ? run.ts : Math.min(stats.firstRunTs, run.ts);
+}
+
 /** IPC-only timeline client. Presentation belongs to the Pi extension. */
-export class TimelineClient implements TimelinePort {
+export class TimelineClient {
 	private readonly seen = new Set<string>();
 	private readonly decoder = new FrameDecoder();
-	private baselineStats: Record<string, BotStats> = {};
-	private baselineStatuses: Record<string, RuntimeControlSnapshot> = {};
-	private baselineLastId = 0;
-	private pendingUsage = new Map<number, UsageRun>();
+	private stats: Record<string, BotStats> = {};
+	private statuses: Record<string, RuntimeControlSnapshot> = {};
+	/** Highest llm_runs.id already folded into `stats` (snapshot `lastId` or a later live run). */
+	private appliedMaxId = 0;
 	private readonly pendingSends = new Map<string, PendingSend>();
-	private readonly visionUpdates = new Map<string, CachedVisionUpdate>();
-	private readonly mediaReadyUpdates = new Map<string, CachedMediaReadyUpdate>();
-	private oldestTs = Number.MAX_SAFE_INTEGER;
-	private oldestCursor: TimelineCursor | null = null;
+	private readonly visionUpdates = new BoundedTtlMap<string>(MAX_MEDIA_UPDATES, MEDIA_UPDATE_TTL_MS);
+	private readonly mediaReadyUpdates = new BoundedTtlMap<string>(MAX_MEDIA_UPDATES, MEDIA_UPDATE_TTL_MS);
+	private oldestCursorValue: TimelineCursor | null;
 	private socket: Socket | null = null;
 	private connected = false;
 	private more = true;
@@ -144,7 +203,11 @@ export class TimelineClient implements TimelinePort {
 		private readonly sockPath: string,
 		readonly filter: string | null,
 		private readonly hooks: TimelineHooks,
-	) {}
+		/** Oldest page already shown by the previous client of the same scope (reconnect); null for a fresh feed. */
+		oldestCursor: TimelineCursor | null = null,
+	) {
+		this.oldestCursorValue = oldestCursor;
+	}
 
 	get isConnected(): boolean {
 		return this.connected;
@@ -152,8 +215,8 @@ export class TimelineClient implements TimelinePort {
 	get hasMore(): boolean {
 		return this.more;
 	}
-	get isLoadingOlder(): boolean {
-		return this.loadingOlder;
+	get oldestCursor(): TimelineCursor | null {
+		return this.oldestCursorValue;
 	}
 
 	async connect(): Promise<boolean> {
@@ -182,7 +245,6 @@ export class TimelineClient implements TimelinePort {
 					return;
 				}
 				this.connected = true;
-				this.emitStatus();
 				socket.write(encodeFrame({ type: "hello", ...(this.filter ? { filter: this.filter } : {}) }));
 				finish(true);
 			});
@@ -213,8 +275,7 @@ export class TimelineClient implements TimelinePort {
 	requestOlder(): boolean {
 		if (this.loadingOlder || !this.more || !this.connected || !this.socket) return false;
 		this.loadingOlder = true;
-		this.hooks.onEvent({ type: "status", text: "loading older Telegram history..." });
-		const before = this.oldestCursor ?? { ts: this.oldestTs, id: Number.MAX_SAFE_INTEGER, rank: 1 };
+		const before = this.oldestCursorValue ?? { ts: Number.MAX_SAFE_INTEGER, id: Number.MAX_SAFE_INTEGER, rank: 1 };
 		this.socket.write(encodeFrame({ type: "history", before, limit: 100 }));
 		return true;
 	}
@@ -282,76 +343,41 @@ export class TimelineClient implements TimelinePort {
 		} else if (message.type === "snapshot") {
 			this.emitFresh("append", message.items);
 			if (message.stats) {
-				this.baselineStats = message.stats.bots;
-				this.baselineStatuses = message.stats.statuses;
-				this.baselineLastId = message.stats.lastId;
-				for (const id of this.pendingUsage.keys()) if (id <= this.baselineLastId) this.pendingUsage.delete(id);
+				this.stats = message.stats.bots;
+				this.statuses = message.stats.statuses;
+				this.appliedMaxId = message.stats.lastId;
 				this.emitStats();
 			}
-			this.emitStatus();
 		} else if (message.type === "history") {
 			this.more = message.hasMore;
 			this.loadingOlder = false;
 			this.emitFresh("prepend", message.items);
-			this.emitStatus(this.more ? undefined : "oldest Telegram record reached");
 		} else if (message.type === "append") {
 			this.emitFresh("append", [message.item]);
 		} else if (message.type === "usage") {
-			this.pendingUsage.set(message.run.id, message.run);
-			if (this.pendingUsage.size > MAX_PENDING_USAGE) {
-				const oldest = this.pendingUsage.keys().next().value as number | undefined;
-				if (oldest !== undefined) this.pendingUsage.delete(oldest);
-			}
+			if (message.run.id <= this.appliedMaxId) return;
+			this.appliedMaxId = message.run.id;
+			const stats = { ...(this.stats[message.run.botId] ?? emptyBotStats()) };
+			applyRun(stats, message.run);
+			this.stats = { ...this.stats, [message.run.botId]: stats };
 			this.emitStats();
 		} else if (message.type === "vision_update") {
-			this.receiveVisionUpdate(message.fileUniqueId, message.text);
+			const text = message.text.trim();
+			if (message.fileUniqueId && text && this.visionUpdates.set(message.fileUniqueId, text)) {
+				this.hooks.onEvent({ type: "vision", fileUniqueId: message.fileUniqueId, text });
+			}
 		} else if (message.type === "media_ready") {
-			this.receiveMediaReady(message.fileUniqueId, message.mediaPath);
+			const { fileUniqueId, mediaPath } = message;
+			if (
+				fileUniqueId &&
+				mediaPath &&
+				!mediaPath.includes("\0") &&
+				this.mediaReadyUpdates.set(fileUniqueId, mediaPath)
+			) {
+				this.hooks.onEvent({ type: "media", fileUniqueId, mediaPath });
+			}
 		} else if (message.type === "agent_stream") {
 			this.hooks.onEvent({ type: "stream", stream: message.stream });
-		}
-	}
-
-	private receiveVisionUpdate(fileUniqueId: string, value: string): void {
-		const text = value.trim();
-		if (!fileUniqueId || !text) return;
-		this.pruneVisionUpdates();
-		const existing = this.visionUpdates.get(fileUniqueId);
-		if (existing?.text === text) return;
-		if (!existing && this.visionUpdates.size >= MAX_VISION_UPDATES) {
-			const oldest = this.visionUpdates.keys().next().value as string | undefined;
-			if (oldest) this.visionUpdates.delete(oldest);
-		}
-		this.visionUpdates.delete(fileUniqueId);
-		this.visionUpdates.set(fileUniqueId, { text, expiresAt: Date.now() + VISION_UPDATE_TTL_MS });
-		this.hooks.onEvent({ type: "vision", fileUniqueId, text });
-	}
-
-	private pruneVisionUpdates(): void {
-		const now = Date.now();
-		for (const [fileUniqueId, update] of this.visionUpdates) {
-			if (update.expiresAt <= now) this.visionUpdates.delete(fileUniqueId);
-		}
-	}
-
-	private receiveMediaReady(fileUniqueId: string, mediaPath: string): void {
-		if (!fileUniqueId || !mediaPath || mediaPath.includes("\0")) return;
-		this.pruneMediaReadyUpdates();
-		const existing = this.mediaReadyUpdates.get(fileUniqueId);
-		if (existing?.mediaPath === mediaPath) return;
-		if (!existing && this.mediaReadyUpdates.size >= MAX_MEDIA_READY_UPDATES) {
-			const oldest = this.mediaReadyUpdates.keys().next().value as string | undefined;
-			if (oldest) this.mediaReadyUpdates.delete(oldest);
-		}
-		this.mediaReadyUpdates.delete(fileUniqueId);
-		this.mediaReadyUpdates.set(fileUniqueId, { mediaPath, expiresAt: Date.now() + MEDIA_READY_TTL_MS });
-		this.hooks.onEvent({ type: "media", fileUniqueId, mediaPath });
-	}
-
-	private pruneMediaReadyUpdates(): void {
-		const now = Date.now();
-		for (const [fileUniqueId, update] of this.mediaReadyUpdates) {
-			if (update.expiresAt <= now) this.mediaReadyUpdates.delete(fileUniqueId);
 		}
 	}
 
@@ -382,17 +408,14 @@ export class TimelineClient implements TimelinePort {
 	}
 
 	private emitFresh(type: "append" | "prepend", items: TimelineItem[]): void {
-		this.pruneVisionUpdates();
-		this.pruneMediaReadyUpdates();
 		const fresh = items
 			.filter((item) => {
 				const key = itemKey(item);
 				if (this.seen.has(key)) return false;
 				this.seen.add(key);
 				const cursor = cursorOf(item);
-				if (cursor && (!this.oldestCursor || compareCursor(cursor, this.oldestCursor) < 0)) {
-					this.oldestTs = item.ts;
-					this.oldestCursor = cursor;
+				if (!this.oldestCursorValue || compareCursor(cursor, this.oldestCursorValue) < 0) {
+					this.oldestCursorValue = cursor;
 				}
 				return true;
 			})
@@ -401,53 +424,13 @@ export class TimelineClient implements TimelinePort {
 				const vision = this.visionUpdates.get(item.fileUniqueId);
 				const media = this.mediaReadyUpdates.get(item.fileUniqueId);
 				return vision || media
-					? { ...item, ...(vision ? { mediaDesc: vision.text } : {}), ...(media ? { mediaPath: media.mediaPath } : {}) }
+					? { ...item, ...(vision ? { mediaDesc: vision } : {}), ...(media ? { mediaPath: media } : {}) }
 					: item;
 			});
 		if (fresh.length > 0) this.hooks.onEvent({ type, items: fresh });
 	}
 
-	private emitStatus(override?: string): void {
-		this.hooks.onEvent({
-			type: "status",
-			text: override ?? (this.filter ? `connected · bot ${this.filter}` : "connected · all bots"),
-		});
-	}
-
 	private emitStats(): void {
-		const stats: Record<string, BotStats> = {};
-		for (const [botId, baseline] of Object.entries(this.baselineStats)) {
-			const live = [...this.pendingUsage.values()]
-				.filter((run) => run.botId === botId && run.id > this.baselineLastId)
-				.sort((left, right) => left.id - right.id);
-			const merged: BotStats = { ...baseline };
-			for (const run of live) {
-				merged.runs++;
-				merged.contextTokens += run.contextTokens;
-				merged.cacheRead += run.cacheRead;
-				merged.cacheWrite += run.cacheWrite;
-				if (run.cacheEstimated) merged.estimatedCacheRuns++;
-				merged.cacheMiss += run.cacheMiss;
-				merged.outputTokens += run.outputTokens;
-				if (!run.compaction) merged.speedOutputTokens += run.outputTokens;
-				merged.reasoningTokens += run.reasoningTokens;
-				if (!run.compaction) {
-					merged.totalThinkingMs += run.thinkingMs ?? 0;
-					merged.thinkingSamples++;
-				}
-				merged.totalSendMs += run.sendMs ?? 0;
-				merged.sendSamples += run.sendSamples ?? 0;
-				if (run.latencyMs != null) {
-					merged.totalLatencyMs += run.latencyMs;
-					merged.latencySamples++;
-				}
-				merged.cost += run.cost;
-				merged.epoch = Math.max(merged.epoch, run.epoch);
-				merged.firstRunTs = merged.firstRunTs == null ? run.ts : Math.min(merged.firstRunTs, run.ts);
-				if (!run.compaction) merged.last = run;
-			}
-			stats[botId] = merged;
-		}
-		this.hooks.onEvent({ type: "stats", stats, statuses: this.baselineStatuses });
+		this.hooks.onEvent({ type: "stats", stats: this.stats, statuses: this.statuses });
 	}
 }

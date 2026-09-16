@@ -44,6 +44,13 @@ import { readMediaImage, TimelineClient, type TimelineEvent } from "../src/plugi
 import { BotApi } from "../src/telegram/api.ts";
 import { normalizeMessage } from "../src/telegram/normalize.ts";
 
+const unusedIpcServices = {
+	manualSend: async () => {
+		throw new Error("manual send unused");
+	},
+	runtimeSnapshot: () => undefined,
+};
+
 const temporaryDirectories = new Set<string>();
 const logLines: string[] = [];
 let restoreLogSink: (() => void) | null = null;
@@ -201,6 +208,7 @@ describe("cross-bot media acquisition", () => {
 		const options = {
 			cacheDir,
 			botApis: apis,
+			videoTranscoder: { ffmpeg: true, ffprobe: true },
 			resize: async (bytes: Uint8Array, mimeType: string, resizeOpts?: unknown) => {
 				resizeCalls++;
 				resizeOptions = resizeOpts;
@@ -224,12 +232,15 @@ describe("cross-bot media acquisition", () => {
 			const first = ensureContextMedia(db, apiA, "A", "shared-photo", options);
 			const second = ensureContextMedia(db, apiB, "B", "shared-photo", options);
 			expect(first).toBe(second);
-			const refs = await first;
-			expect(await second).toEqual(refs);
+			const result = await first;
+			expect(await second).toEqual(result);
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			const refs = result.images;
 			expect(refs).toHaveLength(1);
-			expect(refs?.[0]?.mime).toBe("image/jpeg");
-			expect(refs?.[0]?.name.endsWith(".jpg")).toBe(true);
-			expect(existsSync(join(cacheDir, refs?.[0]?.name ?? ""))).toBe(true);
+			expect(refs[0]?.mime).toBe("image/jpeg");
+			expect(refs[0]?.name.endsWith(".jpg")).toBe(true);
+			expect(existsSync(join(cacheDir, refs[0]?.name ?? ""))).toBe(true);
 			expect(calls).toEqual(["A:get:file-a", "A:download:A.jpg"]);
 			expect(resizeCalls).toBe(1);
 			expect(resizeOptions).toEqual({
@@ -256,7 +267,7 @@ describe("cross-bot media acquisition", () => {
 					throw new Error("persisted context refs were bypassed");
 				},
 			};
-			expect(await ensureContextMedia(db, bypassed, "B", "shared-photo", options)).toEqual(refs);
+			expect(await ensureContextMedia(db, bypassed, "B", "shared-photo", options)).toEqual({ ok: true, images: refs });
 			expect(calls).toEqual(["A:get:file-a", "A:download:A.jpg"]);
 			expect(resizeCalls).toBe(1);
 		} finally {
@@ -311,12 +322,15 @@ describe("cross-bot media acquisition", () => {
 			const first = ensureContextMedia(db, apiA, "A", "shared-video", options);
 			const second = ensureContextMedia(db, apiB, "B", "shared-video", options);
 			expect(first).toBe(second);
-			const refs = await first;
-			expect(await second).toEqual(refs);
+			const result = await first;
+			expect(await second).toEqual(result);
 			expect(extractCalls).toBe(1);
-			expect(refs?.map((ref) => ref.mime)).toEqual(["image/jpeg", "image/jpeg", "image/jpeg"]);
-			expect(new Set(refs?.map((ref) => ref.name)).size).toBe(3);
-			for (const ref of refs ?? []) {
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			const refs = result.images;
+			expect(refs.map((ref) => ref.mime)).toEqual(["image/jpeg", "image/jpeg", "image/jpeg"]);
+			expect(new Set(refs.map((ref) => ref.name)).size).toBe(3);
+			for (const ref of refs) {
 				expect(ref.name.endsWith(".jpg")).toBe(true);
 				expect(existsSync(join(cacheDir, ref.name))).toBe(true);
 			}
@@ -339,7 +353,7 @@ describe("cross-bot media acquisition", () => {
 		}
 	});
 
-	test("returns null for a video without a transcoder before any download", async () => {
+	test("reports a missing transcoder for a video before any download", async () => {
 		const directory = temporaryDirectory("tg-context-transcoder-");
 		const db = openDb(join(directory, "agent.db"));
 		let telegramCalls = 0;
@@ -367,8 +381,9 @@ describe("cross-bot media acquisition", () => {
 			db.query(
 				"INSERT INTO media_file_ids (bot_id, file_id, file_unique_id) VALUES ('A', 'gated-file', 'gated-video')",
 			).run();
-			expect(await ensureContextMedia(db, api, "A", "gated-video", options)).toBeNull();
-			expect(await ensureContextMedia(db, api, "A", "gated-video", options)).toBeNull();
+			const gated = { ok: false as const, outcome: "video_transcoder_unavailable" as const };
+			expect(await ensureContextMedia(db, api, "A", "gated-video", options)).toEqual(gated);
+			expect(await ensureContextMedia(db, api, "A", "gated-video", options)).toEqual(gated);
 			expect(telegramCalls).toBe(0);
 			expect(extractionAttempts).toBe(0);
 			expect(
@@ -417,7 +432,10 @@ describe("cross-bot media acquisition", () => {
 			db.query(
 				"INSERT INTO media_file_ids (bot_id, file_id, file_unique_id) VALUES ('A', 'retry-file', 'retry-video')",
 			).run();
-			expect(await ensureContextMedia(db, api, "A", "retry-video", options)).toBeNull();
+			expect(await ensureContextMedia(db, api, "A", "retry-video", options)).toEqual({
+				ok: false,
+				outcome: "video_frame_extraction_failed",
+			});
 			expect(
 				(
 					db.query("SELECT context_files FROM media WHERE file_unique_id = 'retry-video'").get() as {
@@ -425,8 +443,8 @@ describe("cross-bot media acquisition", () => {
 					}
 				).context_files,
 			).toBeNull();
-			const refs = await ensureContextMedia(db, api, "A", "retry-video", options);
-			expect(refs).toHaveLength(1);
+			const result = await ensureContextMedia(db, api, "A", "retry-video", options);
+			expect(result.ok && result.images).toHaveLength(1);
 			// The source download from the failed attempt is reused from the local cache.
 			expect(telegramCalls).toBe(2);
 			expect(extractionAttempts).toBe(2);
@@ -435,7 +453,7 @@ describe("cross-bot media acquisition", () => {
 		}
 	});
 
-	test("returns null for media that can never become context images", async () => {
+	test("reports media that can never become context images without downloading", async () => {
 		const directory = temporaryDirectory("tg-context-unsupported-");
 		const db = openDb(join(directory, "agent.db"));
 		const api: MediaDownloadApi = {
@@ -452,8 +470,12 @@ describe("cross-bot media acquisition", () => {
 			insert.run("audio-track", "audio", "audio/mpeg");
 			insert.run("tgs-sticker", "sticker", "application/x-tgsticker");
 			insert.run("pdf-document", "document", "application/pdf");
+			const options = { cacheDir: join(directory, "media"), videoTranscoder: { ffmpeg: true, ffprobe: true } };
 			for (const id of ["voice-note", "audio-track", "tgs-sticker", "pdf-document"]) {
-				expect(await ensureContextMedia(db, api, "A", id, { cacheDir: join(directory, "media") })).toBeNull();
+				expect(await ensureContextMedia(db, api, "A", id, options)).toEqual({
+					ok: false,
+					outcome: "media_unavailable",
+				});
 			}
 			expect(db.query("SELECT COUNT(*) count FROM media WHERE context_files IS NOT NULL").get()).toEqual({
 				count: 0,
@@ -523,14 +545,13 @@ describe("cross-bot media acquisition", () => {
 			db.query(
 				"INSERT INTO media_file_ids (bot_id, file_id, file_unique_id) VALUES ('A', 'file-a', 'shared-vision'), ('B', 'file-b', 'shared-vision')",
 			).run();
-			const first = ensureVision(db, apiA as never, "A", "shared-vision", executor, {
+			const options = {
 				cacheDir: join(directory, "media"),
 				botApis: apis,
-			});
-			const second = ensureVision(db, apiB as never, "B", "shared-vision", executor, {
-				cacheDir: join(directory, "media"),
-				botApis: apis,
-			});
+				videoTranscoder: { ffmpeg: true, ffprobe: true },
+			};
+			const first = ensureVision(db, apiA as never, "A", "shared-vision", executor, options);
+			const second = ensureVision(db, apiB as never, "B", "shared-vision", executor, options);
 			expect(first).toBe(second);
 			await entered;
 			expect(describeCalls).toBe(1);
@@ -544,12 +565,9 @@ describe("cross-bot media acquisition", () => {
 					throw new Error("persisted vision cache was bypassed");
 				},
 			} satisfies VisionExecutor;
-			expect(
-				await ensureVision(db, apiB as never, "B", "shared-vision", cachedExecutor, {
-					cacheDir: join(directory, "media"),
-					botApis: apis,
-				}),
-			).toBe("one shared description");
+			expect(await ensureVision(db, apiB as never, "B", "shared-vision", cachedExecutor, options)).toBe(
+				"one shared description",
+			);
 			expect(describeCalls).toBe(1);
 			expect(
 				JSON.parse(
@@ -619,6 +637,7 @@ describe("cross-bot media acquisition", () => {
 			const options = {
 				cacheDir: join(directory, "media"),
 				botApis: apis,
+				videoTranscoder: { ffmpeg: true, ffprobe: true },
 				extractFrames: async () => {
 					extractCalls++;
 					return {
@@ -698,6 +717,64 @@ describe("cross-bot media acquisition", () => {
 				(db.query("SELECT vision FROM media WHERE file_unique_id = 'retry-video'").get() as { vision: string | null })
 					.vision,
 			).toBeNull();
+		} finally {
+			db.close();
+		}
+	});
+
+	test("does not persist a transient provider outcome and retries on the next call", async () => {
+		const directory = temporaryDirectory("tg-vision-transient-");
+		const db = openDb(join(directory, "agent.db"));
+		const api: MediaDownloadApi = {
+			getFile: async () => ({ file_path: "photos/flaky.jpg" }),
+			downloadFile: async () => new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+		};
+		let describeCalls = 0;
+		const outcomes: string[] = [];
+		const executor: VisionExecutor = {
+			modelRef: "test/vision:low",
+			provider: "test",
+			model: "vision",
+			readinessFailure: null,
+			describe: async () => {
+				describeCalls++;
+				const timedOut = describeCalls === 1;
+				return {
+					text: timedOut ? null : "eventually described",
+					telemetry: {
+						kind: "photo",
+						sourceBytesBucket: "lt_32_kib",
+						convertedBytesBucket: "lt_32_kib",
+						latencyMs: 1,
+						inputTokens: 0,
+						outputTokens: 0,
+						reasoningTokens: 0,
+						cost: 0,
+						outcome: timedOut ? "provider_timeout" : "ok",
+						providerCalled: true,
+					},
+				};
+			},
+		};
+		const options = {
+			cacheDir: join(directory, "media"),
+			videoTranscoder: { ffmpeg: true, ffprobe: true },
+			onTelemetry: (telemetry: { outcome: string }) => outcomes.push(telemetry.outcome),
+		};
+		const vision = () =>
+			(db.query("SELECT vision FROM media WHERE file_unique_id = 'flaky-photo'").get() as { vision: string | null })
+				.vision;
+		try {
+			db.query("INSERT INTO media (file_unique_id, kind, mime) VALUES ('flaky-photo', 'photo', 'image/jpeg')").run();
+			db.query(
+				"INSERT INTO media_file_ids (bot_id, file_id, file_unique_id) VALUES ('A', 'flaky-file', 'flaky-photo')",
+			).run();
+			expect(await ensureVision(db, api as never, "A", "flaky-photo", executor, options)).toBeNull();
+			expect(vision()).toBeNull();
+			expect(await ensureVision(db, api as never, "A", "flaky-photo", executor, options)).toBe("eventually described");
+			expect(describeCalls).toBe(2);
+			expect(outcomes).toEqual(["provider_timeout", "ok"]);
+			expect(JSON.parse(vision() ?? "{}").text).toBe("eventually described");
 		} finally {
 			db.close();
 		}
@@ -881,7 +958,14 @@ describe("cross-bot media acquisition", () => {
 			};
 			expect(stored.local_path).toBe("bot-sticker.webp");
 
-			const ipc = new IpcServer(db, join(directory, "daemon.sock"), new Map([["A", "bot"]]), new Map([["A", 777]]));
+			const ipc = new IpcServer(
+				db,
+				join(directory, "daemon.sock"),
+				new Map([["A", "bot"]]),
+				new Map([["A", 777]]),
+				unusedIpcServices.manualSend,
+				unusedIpcServices.runtimeSnapshot,
+			);
 			const row = db.query("SELECT * FROM messages WHERE message_id = 42").get() as never;
 			const item = ipc.msgToItem(row);
 			expect(item.isBot).toBe(true);
@@ -1121,6 +1205,8 @@ describe("post-compaction media cache pruning", () => {
 			expect(first).toEqual({ scanned: 3, deleted: 1, stale: 1, failed: 1 });
 			expect(existsSync(join(mediaDir, "unreferenced.jpg"))).toBe(false);
 			expect(existsSync(join(mediaDir, "unreferenced-ctx.jpg"))).toBe(false);
+			// An undeletable file is reported (`failed`) and its refs are cleared so it cannot occupy
+			// the rowid-ordered batch forever; the leaked file is the operator's signal.
 			expect(existsSync(join(mediaDir, "failed.jpg"))).toBe(true);
 			expect(
 				db.query("SELECT file_unique_id, local_path, vision, context_files FROM media ORDER BY rowid").all(),
@@ -1145,12 +1231,7 @@ describe("post-compaction media cache pruning", () => {
 				},
 				{ file_unique_id: "unreferenced", local_path: null, vision: expect.any(String), context_files: null },
 				{ file_unique_id: "stale", local_path: null, vision: expect.any(String), context_files: null },
-				{
-					file_unique_id: "failed",
-					local_path: "failed.jpg",
-					vision: expect.any(String),
-					context_files: expect.any(String),
-				},
+				{ file_unique_id: "failed", local_path: null, vision: expect.any(String), context_files: null },
 				{
 					file_unique_id: "pending",
 					local_path: "pending.jpg",
@@ -1185,8 +1266,8 @@ describe("post-compaction media cache pruning", () => {
 			db.exec("DELETE FROM bot_visible_messages; DELETE FROM reply_obligations;");
 			db.query("UPDATE bot_cursors SET consumed_seq = ?").run(highWater);
 			expect(pruneUnreferencedMediaCache(db, mediaDir, ["A", "B"])).toEqual({
-				scanned: 6,
-				deleted: 6,
+				scanned: 5,
+				deleted: 5,
 				stale: 0,
 				failed: 0,
 			});
@@ -1223,7 +1304,14 @@ describe("Pi attach media presentation", () => {
 					truncated: false,
 				}),
 			);
-			const ipc = new IpcServer(db, join(directory, "daemon.sock"), new Map([["A", "bot A"]]), new Map());
+			const ipc = new IpcServer(
+				db,
+				join(directory, "daemon.sock"),
+				new Map([["A", "bot A"]]),
+				new Map(),
+				unusedIpcServices.manualSend,
+				unusedIpcServices.runtimeSnapshot,
+			);
 			const items = (
 				ipc as unknown as {
 					loadTimeline(cursor: null, limit: number, filter: string | null): TimelineItem[];
@@ -1393,7 +1481,14 @@ describe("Pi attach media presentation", () => {
 	test("rejects a stale bot filter instead of silently opening the global view", async () => {
 		const directory = temporaryDirectory("tg-filter-scope-");
 		const db = openDb(join(directory, "agent.db"));
-		const ipc = new IpcServer(db, join(directory, "daemon.sock"), new Map([["A", "bot A"]]), new Map([["A", 1]]));
+		const ipc = new IpcServer(
+			db,
+			join(directory, "daemon.sock"),
+			new Map([["A", "bot A"]]),
+			new Map([["A", 1]]),
+			unusedIpcServices.manualSend,
+			unusedIpcServices.runtimeSnapshot,
+		);
 		ipc.start();
 		const events: TimelineEvent[] = [];
 		let resolveDisconnected!: () => void;
@@ -1422,7 +1517,14 @@ describe("Pi attach media presentation", () => {
 		const directory = temporaryDirectory("tg-filter-handshake-");
 		const socketPath = join(directory, "daemon.sock");
 		const db = openDb(join(directory, "agent.db"));
-		const ipc = new IpcServer(db, socketPath, new Map([["A", "bot A"]]), new Map([["A", 1]]));
+		const ipc = new IpcServer(
+			db,
+			socketPath,
+			new Map([["A", "bot A"]]),
+			new Map([["A", 1]]),
+			unusedIpcServices.manualSend,
+			unusedIpcServices.runtimeSnapshot,
+		);
 		ipc.start();
 		const socket = createConnection(socketPath);
 		const decoder = new FrameDecoder();

@@ -39,8 +39,8 @@ export interface MsgItem {
 export interface EvtItem {
 	kind: "evt";
 	ts: number;
-	/** agent_events.id; absent on live event pushes, which are broadcast before the row id is known. */
-	evtId?: number;
+	/** agent_events.id; live pushes carry the persisted rowid and the same `ts` as the row. */
+	evtId: number;
 	botId: string;
 	botName: string;
 	evtKind: string; // assistant_text|thinking|tool_call|tool_result|send|usage|...
@@ -107,6 +107,8 @@ export interface BotStats {
 	firstRunTs: number | null;
 	cost: number;
 	epoch: number;
+	/** Newest retained run of any kind (`MAX(llm_runs.id)`), 0 when none; `> last.id` means a compaction is newer. */
+	lastRunId: number;
 	/** Latest main-conversation response (`compaction = 0`). */
 	last: UsageRun | null;
 }

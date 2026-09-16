@@ -28,7 +28,7 @@ import {
 	SHARED_PROTOCOL,
 	TOOL_CAPABILITY_DECLARATION,
 } from "../src/agent/prompt.ts";
-import { toolsHash } from "../src/agent/tools.ts";
+import { TOOL_DEFS, toolProtocolHash } from "../src/agent/tools.ts";
 import { recentContextStickerCandidates, stickerCatalogPromptBlock } from "../src/media/sticker-catalog.ts";
 import {
 	NO_SEND_MARKER,
@@ -466,7 +466,7 @@ test("media_update delta between same-day messages keeps one date separator (v16
 });
 
 test("complete provider tool protocol + order stable (REQ-TEST-0001 R2)", () => {
-	expect(toolsHash()).toBe(GOLDEN.tools);
+	expect(toolProtocolHash(TOOL_DEFS)).toBe(GOLDEN.tools);
 });
 
 test("compaction summary prompt grammar stable (REQ-TEST-0001 R2)", () => {
@@ -660,9 +660,9 @@ test("context mode replays no cached vision descriptions as media_update events 
 			}[]
 		).map((row) => row.id);
 	// vision mode (default): the persisted description replays as a media_update delta
-	expect(ingestUpdate(db, "A", photoUpdate(1, 500), 1234).kind).toBe("inserted");
+	expect(ingestUpdate(db, "A", photoUpdate(1, 500), -1001234, true).kind).toBe("inserted");
 	expect(mediaUpdateIds()).toEqual([500]);
 	// context mode: no media_update is produced even when a cached description exists
-	expect(ingestUpdate(db, "A", photoUpdate(2, 501), 1234, false).kind).toBe("inserted");
+	expect(ingestUpdate(db, "A", photoUpdate(2, 501), -1001234, false).kind).toBe("inserted");
 	expect(mediaUpdateIds()).toEqual([500]);
 });

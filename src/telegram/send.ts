@@ -39,7 +39,7 @@ export class SentMessagePersistenceError extends Error {
 const SQLITE_BUSY_RETRY_DELAYS_MS = [25, 100, 250] as const;
 
 /** SQLite reports BUSY/LOCKED synchronously; these retries never repeat Telegram I/O. */
-export function isSqliteBusy(error: unknown): boolean {
+function isSqliteBusy(error: unknown): boolean {
 	const value = error as { code?: unknown; errno?: unknown; message?: unknown } | null;
 	const code = typeof value?.code === "string" ? value.code.toUpperCase() : "";
 	if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return true;
@@ -76,8 +76,7 @@ export interface TelegramCreateFailure {
 export function classifyTelegramCreateFailure(error: unknown): TelegramCreateFailure {
 	if (error instanceof TelegramMarkdownError) return { outcome: "rejected", category: "invalid_request" };
 	if (error instanceof TelegramApiError) {
-		const description = error.description.toLowerCase();
-		if (description.includes("non-json")) return { outcome: "unknown", category: "non_json" };
+		if (error.kind === "non_json") return { outcome: "unknown", category: "non_json" };
 		if (error.code === 408) return { outcome: "unknown", category: "timeout" };
 		if (error.code === 429) return { outcome: "unknown", category: "rate_limited" };
 		if (error.code >= 500) return { outcome: "unknown", category: "server_error" };
@@ -134,10 +133,9 @@ export async function sendTextAndPersist(
  * True only when Telegram has deterministically rejected the entity request before
  * creating a message. Unknown outcomes must never be retried as plain text.
  */
-export function isDeterministicEntityRejection(error: unknown): error is TelegramApiError {
-	if (!(error instanceof TelegramApiError)) return false;
+function isDeterministicEntityRejection(error: unknown): error is TelegramApiError {
+	if (!(error instanceof TelegramApiError) || error.kind !== "api" || error.code !== 400) return false;
 	const description = error.description.toLowerCase();
-	if (description.includes("non-json") || error.code !== 400) return false;
 	return (
 		description.includes("can't parse") ||
 		description.includes("cannot parse") ||
@@ -153,9 +151,10 @@ export function isDeterministicEntityRejection(error: unknown): error is Telegra
 
 /** True only when Telegram proves the rich request was rejected before message creation. */
 export function isDeterministicRichRejection(error: unknown): error is TelegramApiError {
-	if (!(error instanceof TelegramApiError)) return false;
+	if (!(error instanceof TelegramApiError) || error.kind !== "api") return false;
 	const description = error.description.toLowerCase();
-	if (description.includes("non-json")) return false;
+	// Bot API answers 404 "Not Found" for a method it does not know (sendRichMessage predates
+	// some deployments' API version); that proves no message was created.
 	if (error.code === 404) {
 		return (
 			description === "not found" || description.includes("method not found") || description.includes("sendrichmessage")

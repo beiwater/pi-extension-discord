@@ -1,5 +1,4 @@
 import type { Database } from "bun:sqlite";
-import { join } from "node:path";
 import { log } from "../observability/log.ts";
 import {
 	bytesBucket,
@@ -33,7 +32,7 @@ export interface MediaCacheTelemetry {
 	queueDepth: number;
 }
 
-export interface MediaCacheOptions extends EnsureLocalMediaOptions {
+export interface MediaCacheOptions extends Pick<EnsureLocalMediaOptions, "cacheDir"> {
 	onReady?: (fileUniqueId: string, mediaPath: string) => void;
 	onTelemetry?: (telemetry: MediaCacheTelemetry) => void;
 }
@@ -57,7 +56,7 @@ export class MediaCacheQueue {
 	constructor(
 		private readonly db: Database,
 		private readonly apis: ReadonlyMap<string, MediaDownloadApi>,
-		private readonly options: MediaCacheOptions = {},
+		private readonly options: MediaCacheOptions,
 	) {}
 
 	/** Queue one canonical display-media identity. Returns immediately and never blocks polling. */
@@ -78,8 +77,7 @@ export class MediaCacheQueue {
 		)
 			return false;
 		const kind = row.kind as DisplayMediaKind;
-		const cacheDir = this.options.cacheDir ?? join(process.cwd(), "data", "media");
-		if (isDisplayReadyPath(resolveMediaCachePath(cacheDir, row.local_path), this.options.fileOps)) return false;
+		if (isDisplayReadyPath(resolveMediaCachePath(this.options.cacheDir, row.local_path))) return false;
 		if (this.queue.length >= MEDIA_CACHE_MAX_PENDING) {
 			this.emit(kind, "media_cache_skip", "queue_overflow", "unavailable");
 			return false;
@@ -111,13 +109,13 @@ export class MediaCacheQueue {
 			[...this.apis.keys()],
 			MEDIA_CACHE_BACKFILL_LIMIT,
 		);
+		// Any configured bot works as the nominal owner: the download layer selects the bot that
+		// actually holds a file_id mapping (downloadSource), so no second selection lives here.
+		const botId = this.apis.keys().next().value;
+		if (botId == null) return 0;
 		let count = 0;
 		for (const fileUniqueId of fileUniqueIds) {
-			const mappings = this.db
-				.query("SELECT bot_id FROM media_file_ids WHERE file_unique_id = ? ORDER BY rowid")
-				.all(fileUniqueId) as { bot_id: string }[];
-			const mapping = mappings.find((candidate) => this.apis.has(candidate.bot_id));
-			if (mapping && this.schedule(mapping.bot_id, fileUniqueId)) count++;
+			if (this.schedule(botId, fileUniqueId)) count++;
 		}
 		return count;
 	}
@@ -167,7 +165,6 @@ export class MediaCacheQueue {
 		const api = this.apis.get(job.botId)!;
 		const result = await ensureLocalMedia(this.db, api, job.botId, job.fileUniqueId, {
 			cacheDir: this.options.cacheDir,
-			fileOps: this.options.fileOps,
 			signal: this.controller.signal,
 			botApis: this.apis,
 		});

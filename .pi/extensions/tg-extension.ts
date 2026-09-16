@@ -6,7 +6,6 @@ import {
 	AssistantMessageComponent,
 	convertToPng,
 	ToolExecutionComponent,
-	VERSION,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type Theme,
@@ -14,7 +13,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import * as Tui from "@earendil-works/pi-tui";
 import { loadConfig, type BotConfig } from "../../src/config.ts";
-import { redactDaemonLog } from "../../src/daemon/control.ts";
+import { DAEMON_READY_MESSAGE, redactDaemonLog } from "../../src/daemon/control.ts";
 import type {
 	AgentActivity,
 	AgentActivityAssistantSection,
@@ -24,6 +23,7 @@ import type {
 	EvtItem,
 	MsgItem,
 	RuntimeControlSnapshot,
+	TimelineCursor,
 	TimelineItem,
 } from "../../src/ipc.ts";
 import { runNativeConfigWizard } from "../../src/onboarding/config-wizard.ts";
@@ -38,19 +38,17 @@ import {
 	type MediaImage,
 	type TimelineEvent,
 	type TimelineHooks,
-	type TimelinePort,
 } from "../../src/plugin/timeline.ts";
 
 const ENTRY_TYPE = "telegram-chat";
 const FEED_WIDGET_KEY = "telegram-feed";
-const MIN_PI_VERSION = "0.84.1";
 const MAX_ACTIVE_STREAMS = 32;
 const MAX_ENDED_STREAMS = 64;
 const PROCESS_OUTPUT_MAX_BYTES = 64 * 1024;
-export const MEDIA_CACHE_MAX_ENTRIES = 32;
-export const MEDIA_CACHE_MAX_BASE64_BYTES = 32 * 1024 * 1024;
-export const MEDIA_CACHE_MAX_ITEM_BASE64_BYTES = 8 * 1024 * 1024;
-export const MEDIA_CONVERSION_MAX_PENDING = 32;
+const MEDIA_CACHE_MAX_ENTRIES = 32;
+const MEDIA_CACHE_MAX_BASE64_BYTES = 32 * 1024 * 1024;
+const MEDIA_CACHE_MAX_ITEM_BASE64_BYTES = 8 * 1024 * 1024;
+const MEDIA_CONVERSION_MAX_PENDING = 32;
 
 const IDENTITY_COLORS = [
 	"accent",
@@ -63,11 +61,22 @@ const IDENTITY_COLORS = [
 	"mdLink",
 ] as const satisfies readonly ThemeColor[];
 
-type TimelineFactory = (filter: string | null, hooks: TimelineHooks) => TimelinePort;
-export interface ProcessRunResult {
+type TimelineFactory = (
+	filter: string | null,
+	hooks: TimelineHooks,
+	oldestCursor?: TimelineCursor | null,
+) => TimelineClient;
+interface ProcessRunResult {
 	status: number | null;
 	stdout: string;
 	stderr: string;
+}
+type DaemonCommand = "start" | "restart" | "stop" | "status";
+interface DaemonCommandResult {
+	ok: boolean;
+	/** Exit code 0 and the daemon's ready line: the only signal that a feed may reconnect. */
+	ready: boolean;
+	output: string;
 }
 type FeedEntry = { instanceId: string; filter: string | null };
 type ComposeIdentity = Pick<BotConfig, "id" | "name">;
@@ -93,20 +102,10 @@ interface PendingMediaConversion {
 }
 
 /** Pi-owned image rendering with Kitty-only async PNG preparation and bounded local state. */
-export class NativeMediaCache {
+class NativeMediaCache {
 	private readonly states = new Map<string, MediaCacheState>();
 	private readonly pending = new Map<string, PendingMediaConversion>();
 	private totalBytesValue = 0;
-
-	get size(): number {
-		return this.states.size;
-	}
-	get totalBase64Bytes(): number {
-		return this.totalBytesValue;
-	}
-	get pendingCount(): number {
-		return this.pending.size;
-	}
 
 	resolve(message: MsgItem, listener?: MediaReadyListener): MediaImage | null {
 		const source = readMediaImage(message);
@@ -229,7 +228,7 @@ export class NativeMediaCache {
 	}
 }
 
-export type TgCommandDispatch =
+type TgCommandDispatch =
 	| "config"
 	| "attach"
 	| "compose"
@@ -241,19 +240,18 @@ export type TgCommandDispatch =
 	| "stop"
 	| "status-daemon";
 
-export interface TgBotChoice {
+interface TgBotChoice {
 	id: string;
 	name: string;
 }
 
-export interface TgCommandChildren {
+/** Optional trailing argument; unknown tokens are passed through to the parent dispatch for its own error. */
+interface TgCommandChildren {
 	hint: string;
-	optional: boolean;
-	acceptUnknown?: boolean;
 	resolve: (bots: readonly TgBotChoice[]) => readonly TgCommandNode[];
 }
 
-export interface TgCommandNode {
+interface TgCommandNode {
 	token: string;
 	label?: string;
 	description: string;
@@ -261,17 +259,15 @@ export interface TgCommandNode {
 	children?: TgCommandChildren;
 }
 
-export interface TgCompletionItem {
+interface TgCompletionItem {
 	value: string;
 	label: string;
 	description?: string;
 }
 
-function botChildren(dispatch: TgCommandDispatch, optional: boolean, includeOff = false): TgCommandChildren {
+function botChildren(dispatch: TgCommandDispatch, includeOff = false): TgCommandChildren {
 	return {
 		hint: includeOff ? "bot|off" : "bot",
-		optional,
-		acceptUnknown: true,
 		resolve: (bots) => [
 			...bots.map((bot) => ({
 				token: bot.id,
@@ -284,23 +280,23 @@ function botChildren(dispatch: TgCommandDispatch, optional: boolean, includeOff 
 	};
 }
 
-export const TG_COMMAND_TREE: readonly TgCommandNode[] = [
+const TG_COMMAND_TREE: readonly TgCommandNode[] = [
 	{ token: "config", description: "Configure Telegram with Pi dialogs", dispatch: "config" },
 	{
 		token: "attach",
 		description: "Open all bots or one bot for chat",
 		dispatch: "attach",
-		children: botChildren("attach", true),
+		children: botChildren("attach"),
 	},
 	{
 		token: "compose",
 		description: "Use the feed scope, one bot, or Pi",
 		dispatch: "compose",
-		children: botChildren("compose", true, true),
+		children: botChildren("compose", true),
 	},
 	{ token: "more", description: "Load one older history page", dispatch: "more" },
 	{ token: "detach", description: "Disconnect the live feed", dispatch: "detach" },
-	{ token: "status", description: "Show detailed usage", dispatch: "status", children: botChildren("status", true) },
+	{ token: "status", description: "Show detailed usage", dispatch: "status", children: botChildren("status") },
 	{ token: "start", description: "Start the Telegram daemon", dispatch: "start" },
 	{ token: "restart", description: "Gracefully restart every configured bot", dispatch: "restart" },
 	{ token: "stop", description: "Stop the Telegram daemon", dispatch: "stop" },
@@ -335,30 +331,39 @@ function runChildProcess(
 	});
 }
 
+/** Run one daemon control command through the same CLI operators use; output is already secret-redacted. */
+async function runDaemonCommand(rootDir: string, command: DaemonCommand): Promise<DaemonCommandResult> {
+	let result: ProcessRunResult;
+	try {
+		result = await runChildProcess("bun", ["run", "src/main.ts", command], { cwd: rootDir });
+	} catch (error) {
+		result = { status: null, stdout: "", stderr: `failed to run daemon command: ${String(error)}` };
+	}
+	const output = redactDaemonLog([result.stdout, result.stderr].filter(Boolean).join("\n"));
+	const ok = result.status === 0;
+	return {
+		ok,
+		ready: ok && output.split("\n").some((line) => line.startsWith(DAEMON_READY_MESSAGE)),
+		output,
+	};
+}
+
 function normalizedTokens(value: string): string[] {
 	const trimmed = value.trim();
 	return trimmed ? trimmed.split(/\s+/) : [];
 }
 
-export function formatTgHelp(tree: readonly TgCommandNode[] = TG_COMMAND_TREE): string {
-	const syntax = tree.map((node) => {
-		if (!node.children) return node.token;
-		const hint = node.children.optional ? `[${node.children.hint}]` : `<${node.children.hint}>`;
-		return `${node.token} ${hint}`;
-	});
+function formatTgHelp(): string {
+	const syntax = TG_COMMAND_TREE.map((node) => (node.children ? `${node.token} [${node.children.hint}]` : node.token));
 	return `usage: /tg ${syntax.join(" | ")}`;
 }
 
-export function completeTgArguments(
-	argumentPrefix: string,
-	bots: readonly TgBotChoice[],
-	tree: readonly TgCommandNode[] = TG_COMMAND_TREE,
-): TgCompletionItem[] | null {
+function completeTgArguments(argumentPrefix: string, bots: readonly TgBotChoice[]): TgCompletionItem[] | null {
 	const tokens = normalizedTokens(argumentPrefix);
 	const startsNextToken = /\s$/.test(argumentPrefix);
 	const path = startsNextToken ? tokens : tokens.slice(0, -1);
 	const partial = startsNextToken ? "" : (tokens.at(-1) ?? "");
-	let candidates = tree;
+	let candidates = TG_COMMAND_TREE;
 	const valuePath: string[] = [];
 
 	for (const token of path) {
@@ -378,32 +383,26 @@ export function completeTgArguments(
 	}));
 }
 
-export type ParsedTgCommand =
+type ParsedTgCommand =
 	| { ok: true; dispatch: TgCommandDispatch; arguments: string[] }
 	| { ok: false; reason: "empty" | "unknown" | "extra" };
 
-export function parseTgArguments(
-	input: string,
-	bots: readonly TgBotChoice[],
-	tree: readonly TgCommandNode[] = TG_COMMAND_TREE,
-): ParsedTgCommand {
+function parseTgArguments(input: string, bots: readonly TgBotChoice[]): ParsedTgCommand {
 	const tokens = normalizedTokens(input);
 	if (tokens.length === 0) return { ok: false, reason: "empty" };
-	const rootNode = tree.find((candidate) => candidate.token === tokens[0]);
+	const rootNode = TG_COMMAND_TREE.find((candidate) => candidate.token === tokens[0]);
 	if (!rootNode) return { ok: false, reason: "unknown" };
 	let node: TgCommandNode = rootNode;
 
 	for (let index = 1; index < tokens.length; index++) {
-		const children: TgCommandChildren | undefined = node.children;
+		const children = node.children;
 		if (!children) return { ok: false, reason: "extra" };
-		const child: TgCommandNode | undefined = children
-			.resolve(bots)
-			.find((candidate) => candidate.token === tokens[index]);
+		const child = children.resolve(bots).find((candidate) => candidate.token === tokens[index]);
 		if (child) {
 			node = child;
 			continue;
 		}
-		if (children.acceptUnknown && index === tokens.length - 1 && node.dispatch) {
+		if (index === tokens.length - 1 && node.dispatch) {
 			return { ok: true, dispatch: node.dispatch, arguments: tokens.slice(1) };
 		}
 		return { ok: false, reason: "extra" };
@@ -414,18 +413,9 @@ export function parseTgArguments(
 		: { ok: false, reason: "extra" };
 }
 
-export interface TelegramExtensionOptions {
-	rootDir?: string;
-	hostVersion?: string;
-}
-
-export interface TelegramComposeIndicator {
+interface TelegramComposeIndicator {
 	text: string;
 	color: Extract<ThemeColor, "accent" | "warning" | "error">;
-}
-
-export function supportsPiVersion(value: string): boolean {
-	return value.localeCompare(MIN_PI_VERSION, "en", { numeric: true }) >= 0;
 }
 
 /** One-line attached-feed chrome with compose guidance kept beside its Telegram scope. */
@@ -514,7 +504,7 @@ function footerTokens(count: number): string {
 	return `${Math.round(count / 1_000_000)}M`;
 }
 
-export interface TelegramFooterUsage {
+interface TelegramFooterUsage {
 	inputTokens: number;
 	outputTokens: number;
 	cacheRead: number;
@@ -563,6 +553,7 @@ export function telegramFooterUsage(
 		firstRunTs: null,
 		cost: 0,
 		epoch: 0,
+		lastRunId: 0,
 		last: null,
 	};
 	let currentBotId = filter ?? selected[0]![0];
@@ -585,14 +576,21 @@ export function telegramFooterUsage(
 			currentBotId = botId;
 		}
 	}
-	totals.epoch = totals.last?.epoch ?? statsByBot[currentBotId]?.epoch ?? 0;
 
 	const status = statuses[currentBotId];
 	const bot = configured.get(currentBotId);
 	const model = resolveStatusModel(bot, status, host);
+	// A compaction newer than the shown bot's latest main run means Pi's context is unknown until the
+	// next main response (docs/telemetry.md: never fall back to the pre-compaction epoch).
+	const shown = statsByBot[currentBotId];
+	const compactedSinceLast = shown != null && shown.lastRunId > (shown.last?.id ?? 0);
 	// The daemon's window is the clamped effective one (docs/telemetry.md); the catalog value
 	// is only a fallback before the runtime snapshot arrives.
-	const usage = summarizeBotUsage(totals, status?.contextWindow ?? model?.contextWindow ?? 0);
+	const usage = summarizeBotUsage(
+		totals,
+		status?.contextWindow ?? model?.contextWindow ?? 0,
+		compactedSinceLast ? null : undefined,
+	);
 	return {
 		inputTokens: totals.cacheMiss,
 		outputTokens: totals.outputTokens,
@@ -610,7 +608,7 @@ export function telegramFooterUsage(
 	};
 }
 
-export interface TelegramFooterView {
+interface TelegramFooterView {
 	cwd: string;
 	home: string | undefined;
 	branch: string | null;
@@ -864,7 +862,7 @@ function cardHeader(identity: string, metadata: string, theme: Theme, color: The
 	);
 }
 
-export type MediaImageResolver = (item: MsgItem) => MediaImage | null;
+type MediaImageResolver = (item: MsgItem) => MediaImage | null;
 
 export function itemComponent(
 	item: TimelineItem,
@@ -943,7 +941,7 @@ export function itemComponent(
 	return box;
 }
 
-export function streamComponent(
+function streamComponent(
 	stream: Extract<AgentStreamFrame, { phase: "update" }>,
 	theme: Theme,
 	toolHost?: ToolPresentationHost,
@@ -951,8 +949,8 @@ export function streamComponent(
 	return activityComponent(stream.botId, stream.botName, stream.activity, theme, "Streaming", toolHost);
 }
 
-export class TelegramFeed extends Tui.Container {
-	private clientValue: TimelinePort;
+class TelegramFeed extends Tui.Container {
+	private clientValue: TimelineClient;
 	private readonly content = new Tui.Container();
 	private readonly streamContent = new Tui.Container();
 	private readonly items: TimelineItem[] = [];
@@ -962,10 +960,10 @@ export class TelegramFeed extends Tui.Container {
 	private readonly endedStreams = new Set<string>();
 	private statsValue: Record<string, BotStats> = {};
 	private statusesValue: Record<string, RuntimeControlSnapshot> = {};
-	private statusValue = "connecting...";
 	private closed = false;
-	private mediaGeneration = 0;
-	private mediaListener: MediaReadyListener;
+	private readonly mediaListener: MediaReadyListener = (filename) => {
+		if (!this.closed) this.patchItems((item) => item.mediaPath === filename);
+	};
 	private readonly mediaResolver: MediaImageResolver;
 
 	constructor(
@@ -978,14 +976,13 @@ export class TelegramFeed extends Tui.Container {
 		private readonly toolHost?: ToolPresentationHost,
 	) {
 		super();
-		this.mediaListener = this.createMediaListener();
 		this.mediaResolver = (item) => this.mediaCache.resolve(item, this.mediaListener);
 		this.addChild(this.content);
 		this.addChild(this.streamContent);
 		this.clientValue = factory(filter, { onEvent: (event) => this.onEvent(event) });
 	}
 
-	get client(): TimelinePort {
+	get client(): TimelineClient {
 		return this.clientValue;
 	}
 	get stats(): Record<string, BotStats> {
@@ -994,9 +991,6 @@ export class TelegramFeed extends Tui.Container {
 	get statuses(): Record<string, RuntimeControlSnapshot> {
 		return this.statusesValue;
 	}
-	get status(): string {
-		return this.statusValue;
-	}
 	start(): void {
 		void this.clientValue.connect();
 	}
@@ -1004,34 +998,27 @@ export class TelegramFeed extends Tui.Container {
 		return this.clientValue.requestOlder();
 	}
 
-	suspendForRestart(): void {
-		this.clientValue.dispose();
-		this.invalidateMediaListener();
-		this.clearStreams();
-		this.setStatus("restarting Telegram daemon...");
-	}
-
+	/** Reopen the same scope after a daemon restart; the old client's oldest page carries over so /tg more continues. */
 	async reconnect(): Promise<boolean> {
-		this.clientValue.dispose();
+		this.detach();
 		this.closed = false;
-		this.setStatus("reconnecting Telegram feed...");
-		this.clientValue = this.factory(this.filter, { onEvent: (event) => this.onEvent(event) });
+		this.clientValue = this.factory(
+			this.filter,
+			{ onEvent: (event) => this.onEvent(event) },
+			this.clientValue.oldestCursor,
+		);
 		this.rebuildItems();
 		this.requestRender();
 		return this.clientValue.connect();
 	}
 
-	detach(reason = "detached"): void {
+	/** Drop the live socket and ephemeral state; already-rendered history stays. Idempotent. */
+	detach(): void {
 		if (this.closed) return;
 		this.closed = true;
 		this.clientValue.dispose();
-		this.invalidateMediaListener();
+		this.mediaCache.unsubscribe(this.mediaListener);
 		this.clearStreams();
-		this.setStatus(reason);
-	}
-
-	dispose(): void {
-		this.detach();
 	}
 
 	private onEvent(event: TimelineEvent): void {
@@ -1049,23 +1036,17 @@ export class TelegramFeed extends Tui.Container {
 			this.statsValue = event.stats;
 			this.statusesValue = event.statuses;
 		} else if (event.type === "vision") {
-			let updated = false;
-			for (let index = 0; index < this.items.length; index++) {
-				const item = this.items[index]!;
-				if (item.kind !== "msg" || item.fileUniqueId !== event.fileUniqueId || item.mediaDesc === event.text) continue;
-				this.items[index] = { ...item, mediaDesc: event.text };
-				updated = true;
-			}
-			if (updated) this.rebuildItems();
+			this.patchItems((item) => item.fileUniqueId === event.fileUniqueId && item.mediaDesc !== event.text, {
+				mediaDesc: event.text,
+			});
 		} else if (event.type === "media") {
-			this.applyMediaReady(event.fileUniqueId, event.mediaPath);
+			this.patchItems((item) => item.fileUniqueId === event.fileUniqueId && item.mediaPath !== event.mediaPath, {
+				mediaPath: event.mediaPath,
+			});
 		} else if (event.type === "stream") {
 			this.applyStream(event.stream);
-		} else if (event.type === "status") {
-			this.setStatus(event.text);
 		} else {
 			this.clearStreams();
-			this.setStatus(event.reason);
 		}
 		this.changed(event, this);
 	}
@@ -1099,25 +1080,13 @@ export class TelegramFeed extends Tui.Container {
 		this.appendItems(this.items);
 	}
 
-	private refreshMedia(filename: string): void {
-		let refreshed = false;
-		for (const item of this.items) {
-			if (item.kind !== "msg" || item.mediaPath !== filename) continue;
-			const slot = this.cardSlots.get(itemKey(item));
-			if (!slot) continue;
-			slot.clear();
-			slot.addChild(itemComponent(item, this.theme, this.mediaResolver, this.toolHost));
-			refreshed = true;
-		}
-		if (refreshed) this.requestRender();
-	}
-
-	private applyMediaReady(fileUniqueId: string, mediaPath: string): void {
+	/** Apply `patch` to every matching message and re-render only those cards in place. */
+	private patchItems(predicate: (item: MsgItem) => boolean, patch: Partial<MsgItem> = {}): void {
 		let refreshed = false;
 		for (let index = 0; index < this.items.length; index++) {
 			const item = this.items[index]!;
-			if (item.kind !== "msg" || item.fileUniqueId !== fileUniqueId || item.mediaPath === mediaPath) continue;
-			const updated = { ...item, mediaPath };
+			if (item.kind !== "msg" || !predicate(item)) continue;
+			const updated = { ...item, ...patch };
 			this.items[index] = updated;
 			const slot = this.cardSlots.get(itemKey(updated));
 			if (!slot) continue;
@@ -1184,94 +1153,105 @@ export class TelegramFeed extends Tui.Container {
 		this.streams.clear();
 		this.rebuildStreams();
 	}
-
-	private setStatus(value: string): void {
-		this.statusValue = value;
-	}
-
-	private createMediaListener(): MediaReadyListener {
-		const generation = this.mediaGeneration;
-		return (filename) => {
-			if (this.closed || generation !== this.mediaGeneration) return;
-			this.refreshMedia(filename);
-		};
-	}
-
-	private invalidateMediaListener(): void {
-		this.mediaCache.unsubscribe(this.mediaListener);
-		this.mediaGeneration++;
-		this.mediaListener = this.createMediaListener();
-	}
 }
 
-function detachedEntry(data: FeedEntry, theme: Theme, supported: boolean): Tui.Component {
+function detachedEntry(data: FeedEntry, theme: Theme): Tui.Component {
 	const box = new Tui.Box(1, 0, (text) => theme.bg("customMessageBg", text));
 	const scope = data.filter ? `bot ${data.filter}` : "all bots";
 	box.addChild(new Tui.Text(theme.bold(theme.fg("accent", `Telegram · ${scope}`)), 0, 0));
-	box.addChild(
-		new Tui.Text(
-			theme.fg(
-				"dim",
-				supported ? "detached · run /tg attach to reconnect" : `requires Pi >= ${MIN_PI_VERSION} · run bun run pi`,
-			),
-			0,
-			0,
-		),
-	);
+	box.addChild(new Tui.Text(theme.fg("dim", "detached · run /tg attach to reconnect"), 0, 0));
 	return box;
 }
 
-export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExtensionOptions = {}): void {
-	const rootDir = options.rootDir ?? process.cwd();
-	const hostVersion = options.hostVersion ?? VERSION;
-	const supported = supportsPiVersion(hostVersion);
-	const factory: TimelineFactory = (filter, hooks) =>
-		new TimelineClient(join(rootDir, "data", "daemon.sock"), filter, hooks);
+/** `/tg status [bot]`: one short IPC connection reads a fresh stats + runtime snapshot, then disconnects. */
+function showTelegramStatus(
+	ctx: ExtensionContext,
+	filter: string | null,
+	factory: TimelineFactory,
+	bots: readonly StatusBot[],
+): Promise<void> {
+	return new Promise<void>((resolve) => {
+		let client: TimelineClient;
+		let done = false;
+		const finish = (text: string, type: "info" | "error") => {
+			if (done) return;
+			done = true;
+			clearTimeout(timer);
+			client.dispose();
+			ctx.ui.notify(text, type);
+			resolve();
+		};
+		const timer = setTimeout(() => finish("timed out waiting for Telegram telemetry", "error"), 3000);
+		client = factory(filter, {
+			onEvent: (event) => {
+				if (event.type === "stats") {
+					const text = Object.entries(event.stats)
+						.map(([id, stats]) =>
+							statsText(
+								id,
+								stats,
+								bots.find((bot) => bot.id === id),
+								event.statuses[id],
+								ctx,
+							),
+						)
+						.join("\n\n");
+					finish(text || "no telemetry yet", "info");
+				} else if (event.type === "disconnected") finish(event.reason, "error");
+			},
+		});
+		void client.connect();
+	});
+}
+
+export function registerTelegramExtension(pi: ExtensionAPI, rootDir = process.cwd()): void {
+	const factory: TimelineFactory = (filter, hooks, oldestCursor) =>
+		new TimelineClient(join(rootDir, "data", "daemon.sock"), filter, hooks, oldestCursor);
 	const mediaCache = new NativeMediaCache();
 	const feeds = new Map<string, TelegramFeed>();
 	let pending: { data: FeedEntry; changed: (event: TimelineEvent, feed: TelegramFeed) => void } | null = null;
 	let active: TelegramFeed | null = null;
 	let compose: ComposeMode | null = null;
-	let composeGeneration = 0;
 	let sending = false;
 	let lastUi: ExtensionContext["ui"] | null = null;
-	let completionBots: TgBotChoice[] | undefined;
-	let statusBots: StatusBot[] | undefined;
+	let bots: BotConfig[] | undefined;
 	let requestHostRender: (() => void) | null = null;
 	let toolHost: ToolPresentationHost | undefined;
 	let composeIndicator: TelegramComposeIndicator | null = null;
-	const getCompletionBots = (): TgBotChoice[] => {
-		if (completionBots) return completionBots;
+
+	/** Startup-validated config, read from disk once per process (invalidated after `/tg config`). Throws on error. */
+	const loadBots = (): BotConfig[] => {
+		if (!bots) bots = loadConfig(rootDir).bots;
+		return bots;
+	};
+	const configuredBots = (): BotConfig[] => {
 		try {
-			completionBots = loadConfig(rootDir).bots.map(({ id, name }) => ({ id, name }));
-			return completionBots;
+			return loadBots();
 		} catch {
 			return [];
 		}
 	};
-	const getStatusBots = (): StatusBot[] => {
-		if (statusBots) return statusBots;
+	const findBot = (id: string, ui: ExtensionContext["ui"]): BotConfig | undefined => {
 		try {
-			statusBots = loadConfig(rootDir).bots.map(
-				({ id, name, provider, model, reasoningEffort, routingP, samplingCooldownMs }) => ({
-					id,
-					name,
-					provider,
-					model,
-					reasoningEffort,
-					routingP,
-					samplingCooldownMs,
-				}),
+			const all = loadBots();
+			const bot = all.find((candidate) => candidate.id === id);
+			if (bot) return bot;
+			ui.notify(
+				`unknown bot id "${id}"; configured bots: ${all.map((candidate) => candidate.id).join(", ") || "(none)"}`,
+				"error",
 			);
-			return statusBots;
-		} catch {
-			return [];
+		} catch (error) {
+			ui.notify(`config error: ${(error as Error).message}`, "error");
 		}
+		return undefined;
 	};
+	/** null = all bots, undefined = invalid (already notified). */
+	const resolveFilter = (arg: string | undefined, ui: ExtensionContext["ui"]): string | null | undefined =>
+		arg ? findBot(arg, ui)?.id : null;
 
 	const composeLabel = (bot: ComposeIdentity) => (bot.name === bot.id ? bot.id : `${bot.id} (${bot.name})`);
 	const scopeIdentities = (): ComposeIdentity[] => {
-		const identities = getCompletionBots();
+		const identities = configuredBots();
 		return active?.filter ? identities.filter((identity) => identity.id === active?.filter) : identities;
 	};
 	const setComposeIndicator = (value: TelegramComposeIndicator | null) => {
@@ -1279,11 +1259,7 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 		composeIndicator = value;
 		requestHostRender?.();
 	};
-	const showComposeIndicator = (
-		ui: ExtensionContext["ui"],
-		busy?: { kind: "choosing" } | { kind: "sending"; identity: ComposeIdentity },
-	) => {
-		ui.setStatus("telegram-compose", undefined);
+	const showComposeIndicator = (busy?: { kind: "choosing" } | { kind: "sending"; identity: ComposeIdentity }) => {
 		if (!compose) {
 			setComposeIndicator(null);
 			return;
@@ -1309,27 +1285,34 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 			setComposeIndicator({ text: "send unavailable", color: "error" });
 		}
 	};
-	const closeCompose = (ui: ExtensionContext["ui"] | null = lastUi) => {
-		composeGeneration++;
+	// Every open* creates a fresh mode object, so `compose !== mode` detects any change after an await.
+	const closeCompose = () => {
 		compose = null;
 		setComposeIndicator(null);
-		if (ui) ui.setStatus("telegram-compose", undefined);
 	};
-	const openScopeCompose = (ui: ExtensionContext["ui"]) => {
-		composeGeneration++;
+	const openScopeCompose = () => {
 		compose = { kind: "scope" };
-		showComposeIndicator(ui);
+		showComposeIndicator();
 	};
-	const openBotCompose = (ui: ExtensionContext["ui"], identity: ComposeIdentity) => {
-		composeGeneration++;
+	const openBotCompose = (identity: ComposeIdentity) => {
 		compose = { kind: "bot", identity };
-		showComposeIndicator(ui);
+		showComposeIndicator();
 	};
-	const clearFeedUi = (ui: ExtensionContext["ui"] | null = lastUi) => {
+	const clearFeedUi = (ui: ExtensionContext["ui"] | null) => {
 		requestHostRender = null;
 		toolHost = undefined;
 		ui?.setWidget(FEED_WIDGET_KEY, undefined);
 		ui?.setFooter(undefined);
+	};
+	/**
+	 * The one way a live feed stops: compose off, socket closed, widget/footer restored. `keepFeed` keeps the
+	 * detached feed as `active` so `/tg restart` can reconnect it; otherwise the next `/tg more` reports no feed.
+	 */
+	const teardownFeed = (ui: ExtensionContext["ui"] | null, options: { keepFeed?: boolean } = {}) => {
+		closeCompose();
+		active?.detach();
+		if (!options.keepFeed) active = null;
+		clearFeedUi(ui);
 	};
 	const mountFeedUi = (filter: string | null, ctx: ExtensionContext) => {
 		const scope = filter ? `bot ${filter}` : "all bots";
@@ -1355,7 +1338,7 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 						home: process.env.HOME || process.env.USERPROFILE,
 						branch: footerData.getGitBranch(),
 						sessionName: ctx.sessionManager.getSessionName(),
-						usage: feed ? telegramFooterUsage(filter, feed.stats, feed.statuses, getStatusBots(), ctx) : undefined,
+						usage: feed ? telegramFooterUsage(filter, feed.stats, feed.statuses, configuredBots(), ctx) : undefined,
 						availableProviderCount: footerData.getAvailableProviderCount(),
 						statuses: footerData.getExtensionStatuses(),
 					});
@@ -1365,28 +1348,8 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 			};
 		});
 	};
-	const resolveBot = (arg: string | undefined, ui: ExtensionContext["ui"]): BotConfig | undefined => {
-		if (!arg) {
-			ui.notify("missing bot id; usage: /tg compose <bot-id>", "error");
-			return undefined;
-		}
-		try {
-			const bots = loadConfig(rootDir).bots;
-			const bot = bots.find((candidate) => candidate.id === arg);
-			if (bot) return bot;
-			ui.notify(
-				`unknown bot id "${arg}"; configured bots: ${bots.map((candidate) => candidate.id).join(", ") || "(none)"}`,
-				"error",
-			);
-		} catch (error) {
-			ui.notify(`config error: ${(error as Error).message}`, "error");
-		}
-		return undefined;
-	};
 	const attachFeed = (filter: string | null, ctx: ExtensionContext) => {
-		closeCompose(ctx.ui);
-		active?.detach("replaced by a new /tg attach");
-		clearFeedUi(ctx.ui);
+		teardownFeed(ctx.ui);
 		mountFeedUi(filter, ctx);
 		const data = { instanceId: randomUUID(), filter };
 		pending = {
@@ -1394,8 +1357,7 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 			changed: (event, feed) => {
 				requestHostRender?.();
 				if (event.type === "disconnected" && active === feed) {
-					closeCompose(ctx.ui);
-					clearFeedUi(ctx.ui);
+					teardownFeed(ctx.ui);
 					ctx.ui.notify(`Telegram feed disconnected: ${event.reason}`, "error");
 				}
 			},
@@ -1406,7 +1368,31 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 			clearFeedUi(ctx.ui);
 			ctx.ui.notify("Pi did not mount the Telegram transcript entry", "error");
 		} else {
-			openScopeCompose(ctx.ui);
+			openScopeCompose();
+		}
+	};
+
+	/** `/tg restart` from the TUI: suspend the live feed, restart every bot, reconnect the same scope when ready. */
+	const restartDaemonWithFeed = async (ctx: ExtensionContext): Promise<void> => {
+		const feed = active;
+		teardownFeed(ctx.ui, { keepFeed: true });
+		ctx.ui.setStatus("telegram-daemon", "TELEGRAM · RESTARTING");
+		ctx.ui.notify("Restarting every configured Telegram bot...", "info");
+		try {
+			const result = await runDaemonCommand(rootDir, "restart");
+			let output = result.output || "daemon restart";
+			let level: "info" | "error" = result.ok ? "info" : "error";
+			if (result.ready && feed && active === feed) {
+				mountFeedUi(feed.filter, ctx);
+				if (!(await feed.reconnect())) {
+					teardownFeed(ctx.ui);
+					output += "\ndaemon is ready, but the previous feed could not reconnect; run /tg attach again";
+					level = "error";
+				}
+			}
+			ctx.ui.notify(output, level);
+		} finally {
+			ctx.ui.setStatus("telegram-daemon", undefined);
 		}
 	};
 
@@ -1415,7 +1401,7 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 		if (!data) return new Tui.Text(theme.fg("error", "invalid Telegram feed entry"), 1, 0);
 		const existing = feeds.get(data.instanceId);
 		if (existing) return existing;
-		if (!supported || pending?.data.instanceId !== data.instanceId) return detachedEntry(data, theme, supported);
+		if (pending?.data.instanceId !== data.instanceId) return detachedEntry(data, theme);
 		const feed = new TelegramFeed(
 			data.filter,
 			theme,
@@ -1433,10 +1419,8 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 	});
 
 	pi.on("session_shutdown", () => {
-		closeCompose();
-		clearFeedUi();
-		for (const feed of feeds.values()) feed.dispose();
-		active = null;
+		teardownFeed(lastUi);
+		for (const feed of feeds.values()) feed.detach();
 	});
 
 	pi.on("input", async (event, ctx) => {
@@ -1459,15 +1443,15 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 			return { action: "handled" };
 		}
 		if (!active?.client.isConnected) {
-			closeCompose(ctx.ui);
+			closeCompose();
 			ctx.ui.setEditorText(original);
 			ctx.ui.notify("Telegram daemon is disconnected; compose mode was closed and the message was not sent", "error");
 			return { action: "handled" };
 		}
 
 		const mode = compose;
-		const generation = composeGeneration;
 		const feed = active;
+		const feedChanged = () => compose !== mode || active !== feed || !feed.client.isConnected;
 		sending = true;
 		try {
 			let identity: ComposeIdentity;
@@ -1478,13 +1462,13 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 				if (identities.length === 0) {
 					ctx.ui.setEditorText(original);
 					ctx.ui.notify("No configured bot matches the active Telegram feed", "error");
-					closeCompose(ctx.ui);
+					closeCompose();
 					return { action: "handled" };
 				}
 				if (identities.length === 1) {
 					identity = identities[0]!;
 				} else {
-					showComposeIndicator(ctx.ui, { kind: "choosing" });
+					showComposeIndicator({ kind: "choosing" });
 					let selected: string | undefined;
 					try {
 						selected = await ctx.ui.select("Send Telegram message as", identities.map(composeLabel));
@@ -1493,7 +1477,7 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 						ctx.ui.notify("Telegram bot selection failed; the message was restored and was not sent", "error");
 						return { action: "handled" };
 					}
-					if (composeGeneration !== generation || compose !== mode || active !== feed || !feed.client.isConnected) {
+					if (feedChanged()) {
 						ctx.ui.setEditorText(original);
 						ctx.ui.notify("Telegram feed changed while choosing a bot; the message was not sent", "warning");
 						return { action: "handled" };
@@ -1512,12 +1496,12 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 					identity = identities[selectedIndex]!;
 				}
 			}
-			if (composeGeneration !== generation || compose !== mode || active !== feed || !feed.client.isConnected) {
+			if (feedChanged()) {
 				ctx.ui.setEditorText(original);
 				ctx.ui.notify("Telegram feed changed before sending; the message was not sent", "warning");
 				return { action: "handled" };
 			}
-			showComposeIndicator(ctx.ui, { kind: "sending", identity });
+			showComposeIndicator({ kind: "sending", identity });
 			const result = await feed.client.sendText(identity.id, original, randomUUID());
 			if (result.ok) {
 				ctx.ui.notify(`Telegram sent as ${composeLabel(identity)} · #${result.messageId}`, "info");
@@ -1528,30 +1512,29 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 						"Telegram send result is unknown. Check the group before retrying to avoid a duplicate.",
 						"warning",
 					);
-					if (composeGeneration === generation && compose === mode) closeCompose(ctx.ui);
+					if (compose === mode) closeCompose();
 				} else {
 					ctx.ui.notify(`Telegram send failed (${result.code}): ${result.error}`, "error");
-					if (result.code === "service_unavailable" && composeGeneration === generation && compose === mode)
-						closeCompose(ctx.ui);
+					if (result.code === "service_unavailable" && compose === mode) closeCompose();
 				}
 			}
 		} catch (error) {
 			ctx.ui.setEditorText(original);
 			ctx.ui.notify(`Telegram send result is unknown. Check the group before retrying: ${String(error)}`, "warning");
-			if (composeGeneration === generation && compose === mode) closeCompose(ctx.ui);
+			if (compose === mode) closeCompose();
 		} finally {
 			sending = false;
-			if (composeGeneration === generation && compose === mode) showComposeIndicator(ctx.ui);
+			if (compose === mode) showComposeIndicator();
 		}
 		return { action: "handled" };
 	});
 
 	pi.registerCommand("tg", {
 		description: `Telegram: ${formatTgHelp().slice("usage: /tg ".length)}`,
-		getArgumentCompletions: (argumentPrefix) => completeTgArguments(argumentPrefix, getCompletionBots()),
+		getArgumentCompletions: (argumentPrefix) => completeTgArguments(argumentPrefix, configuredBots()),
 		handler: async (args, ctx) => {
 			lastUi = ctx.ui;
-			const parsed = parseTgArguments(args, getCompletionBots());
+			const parsed = parseTgArguments(args, configuredBots());
 			if (!parsed.ok) {
 				ctx.ui.notify(formatTgHelp(), parsed.reason === "empty" ? "info" : "error");
 				return;
@@ -1559,13 +1542,6 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 			const sub = parsed.dispatch;
 			const botArg = parsed.arguments[0];
 			const daemonSub = sub === "start" || sub === "restart" || sub === "stop" || sub === "status-daemon";
-			if (!supported && !daemonSub) {
-				ctx.ui.notify(
-					`Telegram native UI requires Pi >= ${MIN_PI_VERSION}; host is ${hostVersion}. Run: bun run pi`,
-					"error",
-				);
-				return;
-			}
 			if (ctx.mode !== "tui" && !daemonSub) {
 				ctx.ui.notify("Telegram UI requires interactive mode", "error");
 				return;
@@ -1576,54 +1552,26 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 					const result = await runNativeConfigWizard(ctx.ui, {
 						rootDir,
 						restartDaemon: async () => {
-							closeCompose(ctx.ui);
-							active?.detach("configuration changed; waiting for daemon readiness");
-							active = null;
-							clearFeedUi(ctx.ui);
+							teardownFeed(ctx.ui);
 							ctx.ui.setStatus("telegram-config", "TELEGRAM · RESTARTING");
-							let processResult: ProcessRunResult;
-							try {
-								processResult = await runChildProcess("bun", ["run", "src/main.ts", "restart"], { cwd: rootDir });
-							} catch {
-								return { ready: false, diagnostic: "failed to run the controlled daemon restart" };
-							}
-							const diagnostic = redactDaemonLog(
-								[processResult.stdout, processResult.stderr].filter(Boolean).join("\n"),
-							);
-							const ready = processResult.status === 0 && /(^|\n)daemon ready(?:\s|$)/.test(diagnostic);
-							return { ready, ...(ready || !diagnostic ? {} : { diagnostic }) };
+							const { ready, output } = await runDaemonCommand(rootDir, "restart");
+							return { ready, ...(ready || !output ? {} : { diagnostic: output }) };
 						},
 					});
 					if (result.outcome === "ready") {
-						completionBots = undefined;
-						statusBots = undefined;
+						bots = undefined;
 						attachFeed(null, ctx);
 					}
 				} finally {
 					ctx.ui.setStatus("telegram-config", undefined);
 				}
-				return;
-			}
-
-			const resolveFilter = (arg: string | undefined): string | null | undefined => {
-				if (!arg) return null;
-				try {
-					const ids = loadConfig(rootDir).bots.map((bot) => bot.id);
-					if (ids.includes(arg)) return arg;
-					ctx.ui.notify(`unknown bot id "${arg}"; configured bots: ${ids.join(", ") || "(none)"}`, "error");
-				} catch (error) {
-					ctx.ui.notify(`config error: ${(error as Error).message}`, "error");
-				}
-				return undefined;
-			};
-
-			if (sub === "attach") {
-				const filter = resolveFilter(botArg);
+			} else if (sub === "attach") {
+				const filter = resolveFilter(botArg, ctx.ui);
 				if (filter === undefined) return;
 				attachFeed(filter, ctx);
 			} else if (sub === "compose") {
 				if (botArg === "off") {
-					closeCompose(ctx.ui);
+					closeCompose();
 					ctx.ui.notify("Telegram compose mode is off; editor input goes to Pi", "info");
 					return;
 				}
@@ -1632,23 +1580,23 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 					return;
 				}
 				if (!botArg) {
-					openScopeCompose(ctx.ui);
+					openScopeCompose();
 					ctx.ui.notify(
 						"Telegram compose follows the active feed scope. Run /tg compose off to return to Pi.",
 						"warning",
 					);
 					return;
 				}
-				const bot = resolveBot(botArg, ctx.ui);
+				const bot = findBot(botArg, ctx.ui);
 				if (!bot) return;
 				const identity = { id: bot.id, name: bot.name };
-				openBotCompose(ctx.ui, identity);
+				openBotCompose(identity);
 				ctx.ui.notify(
 					`Telegram compose enabled: editor sends as ${composeLabel(identity)}. Run /tg compose off to return to Pi.`,
 					"warning",
 				);
 			} else if (sub === "more") {
-				if (!active) ctx.ui.notify("no live Telegram feed; run /tg attach first", "warning");
+				if (!active?.client.isConnected) ctx.ui.notify("no connected Telegram feed; run /tg attach first", "warning");
 				else if (!active.more())
 					ctx.ui.notify(
 						active.client.hasMore ? "Telegram history request already in progress" : "oldest Telegram record reached",
@@ -1656,79 +1604,17 @@ export function registerTelegramExtension(pi: ExtensionAPI, options: TelegramExt
 					);
 			} else if (sub === "detach") {
 				if (!active) ctx.ui.notify("no live Telegram feed", "warning");
-				else {
-					closeCompose(ctx.ui);
-					active.detach();
-					active = null;
-					clearFeedUi(ctx.ui);
-				}
+				else teardownFeed(ctx.ui);
 			} else if (sub === "status") {
-				const filter = resolveFilter(botArg);
+				const filter = resolveFilter(botArg, ctx.ui);
 				if (filter === undefined) return;
-				const statusBots = getStatusBots();
-				await new Promise<void>((resolve) => {
-					let client: TimelinePort;
-					let done = false;
-					const finish = (text: string, type: "info" | "error") => {
-						if (done) return;
-						done = true;
-						clearTimeout(timer);
-						client.dispose();
-						ctx.ui.notify(text, type);
-						resolve();
-					};
-					const timer = setTimeout(() => finish("timed out waiting for Telegram telemetry", "error"), 3000);
-					client = factory(filter, {
-						onEvent: (event) => {
-							if (event.type === "stats") {
-								const text = Object.entries(event.stats)
-									.map(([id, stats]) =>
-										statsText(
-											id,
-											stats,
-											statusBots.find((bot) => bot.id === id),
-											event.statuses[id],
-											ctx,
-										),
-									)
-									.join("\n\n");
-								finish(text || "no telemetry yet", "info");
-							} else if (event.type === "disconnected") finish(event.reason, "error");
-						},
-					});
-					void client.connect();
-				});
-			} else if (daemonSub) {
-				const command = sub === "status-daemon" ? "status" : sub;
-				const restartFeed = sub === "restart" && ctx.mode === "tui" ? active : null;
-				if (sub === "restart" && ctx.mode === "tui") {
-					closeCompose(ctx.ui);
-					restartFeed?.suspendForRestart();
-					clearFeedUi(ctx.ui);
-					ctx.ui.setStatus("telegram-daemon", "TELEGRAM · RESTARTING");
-					ctx.ui.notify("Restarting every configured Telegram bot...", "info");
-				}
-				let result: ProcessRunResult;
-				try {
-					result = await runChildProcess("bun", ["run", "src/main.ts", command], { cwd: rootDir });
-				} catch (error) {
-					result = { status: null, stdout: "", stderr: `failed to run daemon command: ${String(error)}` };
-				}
-				let output = redactDaemonLog([result.stdout, result.stderr].filter(Boolean).join("\n")) || `daemon ${command}`;
-				let level: "info" | "error" = result.status === 0 ? "info" : "error";
-				if (sub === "restart" && result.status === 0 && output.includes("daemon ready")) {
-					if (restartFeed) {
-						mountFeedUi(restartFeed.filter, ctx);
-						const connected = await restartFeed.reconnect();
-						if (!connected) {
-							clearFeedUi(ctx.ui);
-							output += "\ndaemon is ready, but the previous feed could not reconnect; run /tg attach again";
-							level = "error";
-						}
-					}
-				}
-				if (sub === "restart" && ctx.mode === "tui") ctx.ui.setStatus("telegram-daemon", undefined);
-				ctx.ui.notify(output, level);
+				await showTelegramStatus(ctx, filter, factory, configuredBots());
+			} else if (sub === "restart" && ctx.mode === "tui") {
+				await restartDaemonWithFeed(ctx);
+			} else {
+				const command: DaemonCommand = sub === "status-daemon" ? "status" : sub;
+				const result = await runDaemonCommand(rootDir, command);
+				ctx.ui.notify(result.output || `daemon ${command}`, result.ok ? "info" : "error");
 			}
 		},
 	});

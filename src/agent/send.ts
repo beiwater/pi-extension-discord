@@ -116,10 +116,6 @@ async function sendAttempt(params: SendParams, context: AgentSendContext) {
 	let sendEventAttempted = false;
 	let typingStopAttempted = false;
 
-	const addFailure = (failure: SendFailure): void => {
-		// One tool call has at most two remote components and a small fixed set of local effects.
-		failures.push(failure);
-	};
 	const runLocalEffect = async (
 		component: "message" | "sticker",
 		category: string,
@@ -131,7 +127,7 @@ async function sendAttempt(params: SendParams, context: AgentSendContext) {
 			else effect();
 		} catch (error) {
 			const localCategory = localFailureCategory(error);
-			addFailure({
+			failures.push({
 				failed_component: component,
 				failed_outcome: "committed",
 				stage: "local_effect",
@@ -225,7 +221,7 @@ async function sendAttempt(params: SendParams, context: AgentSendContext) {
 			}
 			throw error;
 		}
-		addFailure({
+		failures.push({
 			failed_component: component,
 			failed_outcome: failure.outcome,
 			stage: "telegram_create",
@@ -247,7 +243,7 @@ async function sendAttempt(params: SendParams, context: AgentSendContext) {
 			await finishCommittedComponent("message", raw, canonical.message_id, transport);
 		} catch (error) {
 			if (!(error instanceof SentMessagePersistenceError)) return await handleCreateFailure("message", error);
-			addFailure({
+			failures.push({
 				failed_component: "message",
 				failed_outcome: "committed",
 				stage: "canonical_persist",
@@ -270,7 +266,7 @@ async function sendAttempt(params: SendParams, context: AgentSendContext) {
 				await finishCommittedComponent("sticker", raw, canonical.message_id);
 			} catch (error) {
 				if (!(error instanceof SentMessagePersistenceError)) throw error;
-				addFailure({
+				failures.push({
 					failed_component: "sticker",
 					failed_outcome: "committed",
 					stage: "canonical_persist",

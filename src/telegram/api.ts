@@ -14,11 +14,14 @@ export class TelegramApiError extends Error {
 	code: number;
 	description: string;
 	retryAfter: number | null;
-	constructor(code: number, description: string, retryAfter: number | null = null) {
+	/** `api`: structured Bot API error body; `non_json`: an intermediary answered with HTML/text. */
+	kind: "api" | "non_json";
+	constructor(code: number, description: string, retryAfter: number | null = null, kind: "api" | "non_json" = "api") {
 		super(`telegram api error ${code}: ${description}`);
 		this.code = code;
 		this.description = description;
 		this.retryAfter = retryAfter;
+		this.kind = kind;
 	}
 }
 
@@ -56,7 +59,7 @@ export class BotApi {
 			body = (await res.json()) as ApiResponse<T>;
 		} catch {
 			// intermediaries can answer with HTML/text (e.g. 502 pages); keep the HTTP status
-			throw new TelegramApiError(res.status, `non-JSON response (HTTP ${res.status})`);
+			throw new TelegramApiError(res.status, `non-JSON response (HTTP ${res.status})`, null, "non_json");
 		}
 		if (!body.ok) {
 			throw new TelegramApiError(

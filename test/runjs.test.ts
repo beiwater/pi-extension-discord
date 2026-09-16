@@ -94,6 +94,29 @@ describe("run_js normal computation", () => {
 		expect(r.output.length).toBeLessThanOrEqual(4096 + 20); // cap + truncation suffix
 	});
 
+	test("one huge console.log line is truncated inside the sandbox and still yields a structured result", async () => {
+		// A single 5 MB line must never reach the parent raw: the wrapper caps it in-context so the
+		// JSON protocol line stays parseable and the final value survives.
+		const r = await runJs("console.log('y'.repeat(5_000_000)); console.log('after'); 'final-value'");
+		expect(r.ok).toBe(true);
+		expect(r.output).toContain("...(truncated)");
+		expect(r.output).toContain("after");
+		expect(r.output).toContain("final-value");
+		expect(r.output.length).toBeLessThanOrEqual(4096 + 20);
+	});
+
+	test("huge error messages and results are bounded", async () => {
+		const failed = await runJs("throw new Error('e'.repeat(100_000))");
+		expect(failed.ok).toBe(false);
+		expect(failed.output.length).toBeLessThanOrEqual(1024 + 20);
+		const rejected = await runJs("Promise.reject(new Error('r'.repeat(100_000)))");
+		expect(rejected.ok).toBe(false);
+		expect(rejected.output.length).toBeLessThanOrEqual(1024 + 20);
+		const big = await runJs("'z'.repeat(1_000_000)");
+		expect(big.ok).toBe(true);
+		expect(big.output.length).toBeLessThanOrEqual(4096 + 20);
+	});
+
 	test("REQ-TEST-0001 R6: oversized code is rejected before spawning", async () => {
 		const r = await runJs("1 + 1\n" + "// pad\n".repeat(5000));
 		expect(r.ok).toBe(false);

@@ -4,6 +4,7 @@
 import { loadConfig } from "../src/config.ts";
 import { openDb, setBotState } from "../src/db/db.ts";
 import { BotApi } from "../src/telegram/api.ts";
+import { inspectVideoTranscoder } from "../src/media/video-frames.ts";
 import { BotRuntime } from "../src/agent/runtime.ts";
 import { createSharedModelRuntime } from "../src/agent/model-runtime.ts";
 import { selectConfiguredBot } from "./bot-selection.ts";
@@ -11,7 +12,7 @@ import { selectConfiguredBot } from "./bot-selection.ts";
 const config = loadConfig(process.cwd());
 const bot = selectConfiguredBot(config.bots, process.argv.slice(2));
 const db = openDb(config.dbPath);
-const chatId = Number(`-100${config.groupPeerId}`);
+const chatId = config.groupChatId;
 
 // bot identity (normally set by daemon)
 const me = await new BotApi(bot.token).getMe();
@@ -34,7 +35,7 @@ db.query(
 );
 
 const modelRuntime = await createSharedModelRuntime([bot]);
-const rt = new BotRuntime(db, bot, config, modelRuntime);
+const rt = new BotRuntime(db, bot, config, modelRuntime, { videoTranscoder: inspectVideoTranscoder() });
 await rt.init();
 
 console.log(`[e2e] triggering bot ${bot.id} (${bot.provider}/${bot.model})...`);

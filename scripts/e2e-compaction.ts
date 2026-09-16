@@ -5,6 +5,7 @@
 import { loadConfig } from "../src/config.ts";
 import { openDb, getBotState, setBotState } from "../src/db/db.ts";
 import { BotApi } from "../src/telegram/api.ts";
+import { inspectVideoTranscoder } from "../src/media/video-frames.ts";
 import { BotRuntime } from "../src/agent/runtime.ts";
 import { createSharedModelRuntime } from "../src/agent/model-runtime.ts";
 import { selectConfiguredBot } from "./bot-selection.ts";
@@ -16,7 +17,7 @@ const me = await new BotApi(bot.token).getMe();
 setBotState(db, bot.id, "bot_user_id", String(me.id));
 setBotState(db, bot.id, "bot_username", me.username);
 const modelRuntime = await createSharedModelRuntime([bot]);
-const rt = new BotRuntime(db, bot, config, modelRuntime);
+const rt = new BotRuntime(db, bot, config, modelRuntime, { videoTranscoder: inspectVideoTranscoder() });
 await rt.init();
 try {
 	const epochBefore = Number(getBotState(db, bot.id, "context_epoch") ?? "1");

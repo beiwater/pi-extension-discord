@@ -22,9 +22,7 @@ import { execFileSync } from "node:child_process";
 import { basename, join, resolve } from "node:path";
 import { errorCategory, log } from "../observability/log.ts";
 
-export const PID_PATH = join(process.cwd(), "data", "daemon.pid");
-
-export function readPid(pidPath: string = PID_PATH): number | null {
+export function readPid(pidPath: string): number | null {
 	if (!existsSync(pidPath)) return null;
 	const pid = Number(readFileSync(pidPath, "utf8").trim());
 	return Number.isFinite(pid) && pid > 0 ? pid : null;
@@ -72,7 +70,10 @@ function processCwd(pid: number): string | null {
 
 function daemonEntry(args: string[]): string | null {
 	if (basename(args[0] ?? "") !== "bun") return null;
-	const runOffset = args[1] === "run" ? 2 : 1;
+	// Skip runtime flags (`bun --smol run …`) and the optional `run` subcommand.
+	let runOffset = 1;
+	while (args[runOffset]?.startsWith("-")) runOffset++;
+	if (args[runOffset] === "run") runOffset++;
 	const entry = args[runOffset];
 	if (!entry) return null;
 	if (/(?:^|\/)daemon\/index(?:\.ts)?$/.test(entry)) return entry;
@@ -176,32 +177,38 @@ export function listOurDaemons(rootDir: string = process.cwd()): number[] {
 }
 
 /**
- * Acquire the exclusive pid lock. Exits the process when another daemon holds it.
- * Stale pid files (dead or foreign process) are removed and retried once.
- * The returned fd keeps the lock held for the daemon's lifetime.
+ * Acquire the exclusive pid file. Exits the process when another daemon holds it.
+ * Only a pid file whose process is dead is taken over; an alive process that cannot be
+ * identified (ps/lsof timeout, unexpected launcher) is treated like a live daemon, same as
+ * the CLI controller does, so two daemons can never long-poll the same tokens.
  */
-export function acquirePidLock(dataDir: string): number {
+export function acquirePidLock(dataDir: string): void {
 	mkdirSync(dataDir, { recursive: true });
 	const pidPath = join(dataDir, "daemon.pid");
-	const tryCreate = (): number => {
-		const fd = openSync(pidPath, "wx");
+	const tryCreate = (): void => {
+		closeSync(openSync(pidPath, "wx"));
 		writeFileSync(pidPath, String(process.pid));
-		return fd;
 	};
 	try {
-		return tryCreate();
+		tryCreate();
+		return;
 	} catch (err) {
 		if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
 		const existing = readPid(pidPath);
-		if (existing != null && pidAlive(existing) && isOurDaemon(existing)) {
-			log.error("daemon", "pid_lock_held", { pid: existing });
-			process.stderr.write(`daemon already running (pid ${existing})\n`);
+		if (existing != null && pidAlive(existing)) {
+			const ours = isOurDaemon(existing);
+			log.error("daemon", "pid_lock_held", { pid: existing, recognized: ours });
+			process.stderr.write(
+				ours
+					? `daemon already running (pid ${existing})\n`
+					: `pid file ${pidPath} names live pid ${existing} that could not be verified as this daemon; refusing to start\n`,
+			);
 			process.exit(1);
 		}
-		// stale (dead or foreign process): take it over
+		// dead process (or malformed file): take it over
 		rmSync(pidPath, { force: true });
 		try {
-			return tryCreate();
+			tryCreate();
 		} catch (err2) {
 			log.error("daemon", "pid_lock_failed", { category: errorCategory(err2) });
 			process.stderr.write("failed to acquire daemon pid lock\n");
@@ -210,13 +217,8 @@ export function acquirePidLock(dataDir: string): number {
 	}
 }
 
-/** Release the lock on shutdown (only when we own the file). */
-export function releasePidLock(pidFd: number, dataDir: string): void {
-	try {
-		closeSync(pidFd);
-	} catch {
-		// already closed
-	}
+/** Remove the pid file on shutdown (only when it still names this process). */
+export function releasePidLock(dataDir: string): void {
 	const pidPath = join(dataDir, "daemon.pid");
 	if (readPid(pidPath) === process.pid) rmSync(pidPath, { force: true });
 }

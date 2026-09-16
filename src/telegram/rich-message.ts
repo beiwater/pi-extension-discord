@@ -1,12 +1,12 @@
 // Deterministic, bounded RichMessage source storage and plain-text projection.
 // Telegram owns rich presentation; Pi/provider only consume the projection.
 
-export const RICH_MESSAGE_MAX_CHARS = 32_768;
-export const RICH_MESSAGE_MAX_BLOCKS = 500;
-export const RICH_MESSAGE_MAX_NODES = 4096;
-export const RICH_MESSAGE_MAX_DEPTH = 16;
-export const RICH_MESSAGE_RAW_MAX_BYTES = 256 * 1024;
-export const RICH_MESSAGE_TRUNCATED = "[rich message truncated]";
+const RICH_MESSAGE_MAX_CHARS = 32_768;
+const RICH_MESSAGE_MAX_BLOCKS = 500;
+const RICH_MESSAGE_MAX_NODES = 4096;
+const RICH_MESSAGE_MAX_DEPTH = 16;
+const RICH_MESSAGE_RAW_MAX_BYTES = 256 * 1024;
+const RICH_MESSAGE_TRUNCATED = "[rich message truncated]";
 export const RICH_MESSAGE_UNAVAILABLE = "[rich message unavailable]";
 
 export interface RichProjection {
@@ -287,7 +287,7 @@ function renderUnknown(
 }
 
 /** Project a Telegram RichMessage into stable plain text without exposing metadata. */
-export function projectRichMessage(value: unknown): RichProjection {
+function projectRichMessage(value: unknown): RichProjection {
 	const state: ProjectionState = { nodes: 0, blocks: 0, truncated: false };
 	let text: string;
 	if (objectValue(value) && Array.isArray(value.blocks)) {

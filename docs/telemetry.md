@@ -26,7 +26,9 @@ daemon 的 runtime snapshot 是 provider/model、**实际生效 reasoning effort
 
 每行 `cost` 在 response 到达时由 Pi 按该行实际 `provider/model` 的当时 catalog 费率计算并固化。累计费用只做 `SUM(cost)`：切换模型后，新 run 使用新模型费率，DeepSeek 等旧 run 保留原费用；catalog 或价格以后变化也不得用当前费率回算历史。订阅型 provider 若只提供等价按量估价，界面显示的是估算成本，不伪装成实际账单。
 
-新增 response 必须同时更新 SQLite 与 live IPC totals；snapshot/push 通过 `llm_runs.id` 去重。compaction usage 参与累计，但不替换 latest 主对话请求。
+新增 response 必须同时更新 SQLite 与 live IPC totals；snapshot/push 通过 `llm_runs.id` 去重：client 记住已折叠的最大 id（snapshot 的 `lastId` 或之后的 live run），`id <=` 该值的推送直接丢弃，其余逐条增量折叠进 per-bot totals，不缓存 run 列表、不重算。compaction usage 参与累计，但不替换 latest 主对话请求。
+
+`BotStats.lastRunId` 是该 bot 保留期内最新一条 run（任意类型）的 `MAX(llm_runs.id)`，无 run 为 0；live 折叠时取 `max(lastRunId, run.id)`。`lastRunId > last.id` 即“compact 之后还没有新的主对话 response”。
 
 `cache_read`、`cache_write` 与 `cache_miss` 永远保留 provider/Pi 返回的原始值。若 provider 没有暴露 cache usage，主对话 run 可另存 nullable `cache_read_estimated`：它只表示两次相邻 raw chat payload 的严格前缀可复用量，不回写或伪装成 provider 原始 usage。
 
@@ -54,6 +56,8 @@ daemon 的 runtime snapshot 是 provider/model、**实际生效 reasoning effort
 
 `≈` 表示“按 raw payload 结构推导的理论可复用前缀”，不是 provider 实际命中或账单证明。费用仍使用 response 到达时固化的原始 provider usage/catalog 估价，绝不按本地估算重算。这样既能在 Ollama-compatible API 不返回 cache token 细项时显示趋势，也不会污染原始取证数据。
 
+分段百分比按最大余数法取一位小数，五段严格相加为 100.0%；Telegram 图例在 system / tool 段为 0 时省略这两行（方块条与 Pi 的 `S/T/C/M/F` 文字不省略）。详细 status 中的时间戳（最近请求、since、最近压缩）按本地时区渲染为 `YYYY-MM-DD HH:MM:SS`，与 attached feed 卡片时钟一致；生产时区为 Asia/Singapore，测试必须 pin `TZ`。
+
 若没有 latest 主对话请求，当前上下文显示 `— / <window>`；若模型目录也没有有效 `contextWindow`，window 与百分比均显示 `—`。上下文上限 MUST 来自 daemon runtime snapshot 中已解析模型的 `contextWindow`（Pi catalog 值被顶层 `context_window` 配置钳制后的生效值），界面不自行查 catalog，也不维护第二份常量。
 
 ## 两个界面的共同字段
@@ -69,7 +73,7 @@ daemon 的 runtime snapshot 是 provider/model、**实际生效 reasoning effort
 
 `/tg status` 与 Telegram `/status` 只是同一明细投影的两种外层渲染；二者的字段 key、顺序和数值必须来自同一个共享投影。Telegram每次只展示实际接收或`@bot_username`定向的单个bot，避免把不同epoch/model的状态并排混淆。
 
-attached feed 的 footer 与 Pi 原生 `FooterComponent` 保持相同信息顺序：第一行是 cwd、git branch 与 session name；第二行左侧按原生顺序显示 lifetime `↑ / ↓ / R / W / CH / $` 和 latest 主对话的 `context%/window (auto)`，右侧按原生宽度规则显示 `(provider) model • reasoning`；其他临时 extension status 仅在存在时追加。compose 状态与 scope/连接状态放在 editor 上方的同一行 feed header，不占 footer 行。all-bots scope 只聚合当前配置 bot，并用最新主对话 run 所属 bot 的 context/model/reasoning。精确整数和完整 runtime 明细仍由 `/tg status` 提供。Pi 没有公开接口把远端 usage 注入原生 `FooterComponent`，因此 extension 只复刻该公开版本的布局，不伪造 `AgentSession`。detach、断线、restart/config 切换与 session shutdown 必须恢复默认 footer。
+attached feed 的 footer 与 Pi 原生 `FooterComponent` 保持相同信息顺序：第一行是 cwd、git branch 与 session name；第二行左侧按原生顺序显示 lifetime `↑ / ↓ / R / W / CH / $` 和 latest 主对话的 `context%/window (auto)`，右侧按原生宽度规则显示 `(provider) model • reasoning`；其他临时 extension status 仅在存在时追加。compose 状态与 scope/连接状态放在 editor 上方的同一行 feed header，不占 footer 行。all-bots scope 只聚合当前配置 bot，并用最新主对话 run 所属 bot 的 context/model/reasoning。footer 没有实时 runtime snapshot（statuses 只随 snapshot 到达），因此用同一规则判定 compact：所示 bot 的 `lastRunId > last.id` 时 context 显示 `?/window`，直到下一条主对话 run 到达，不停留在 compact 前的百分比。精确整数和完整 runtime 明细仍由 `/tg status` 提供。Pi 没有公开接口把远端 usage 注入原生 `FooterComponent`，因此 extension 只复刻该公开版本的布局，不伪造 `AgentSession`。detach、断线、restart/config 切换与 session shutdown 必须恢复默认 footer。
 
 ## 格式与边界
 
@@ -80,6 +84,6 @@ attached feed 的 footer 与 Pi 原生 `FooterComponent` 保持相同信息顺�
 
 ## 验证与更新触发条件
 
-测试 MUST 守卫：latest 排除 compaction、lifetime 包含 compaction、模型切换前后的 immutable per-run cost 跨 provider/model 累加、live compaction totals 不替换 latest、`CH` 分母包含 `W`、无 cache 样本显示 `—`、严格双 payload 前缀才产生本地 cache estimate、原始 cache/cost 不被估算改写、估算值在三个界面均显示 `≈`、当前 context 使用runtime session而非latest/lifetime、compact后unknown不回退旧epoch、Telegram status只显示目标bot且方块图例分行、三个界面共享费用精度、attached footer 保持 Pi 的信息顺序与 model 右对齐、compose guidance 留在单行 feed header，以及两个详细状态投影拥有完全相同的字段 key/顺序。
+测试 MUST 守卫：latest 排除 compaction、lifetime 包含 compaction、模型切换前后的 immutable per-run cost 跨 provider/model 累加、live compaction totals 不替换 latest、`CH` 分母包含 `W`、无 cache 样本显示 `—`、严格双 payload 前缀才产生本地 cache estimate、原始 cache/cost 不被估算改写、估算值在三个界面均显示 `≈`、当前 context 使用runtime session而非latest/lifetime、compact后unknown不回退旧epoch（`/tg status` 经 runtime `currentContextTokens`，footer 经 `lastRunId > last.id`）、live push `id <= lastId` 不重复折叠、分段百分比相加为 100.0 且空 S/T 图例行省略、status 时间戳为本地时区、Telegram status只显示目标bot且方块图例分行、三个界面共享费用精度、attached footer 保持 Pi 的信息顺序与 model 右对齐、compose guidance 留在单行 feed header，以及两个详细状态投影拥有完全相同的字段 key/顺序。
 
 修改 `llm_runs` 字段、IPC `UsageRun` / `BotStats`、`/tg status` 或 Telegram `/status` 时必须同步本文。该模块的 Cache impact 为 **NONE**：它只读取既有 telemetry 并生成 UI/control side-channel。

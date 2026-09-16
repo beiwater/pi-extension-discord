@@ -127,6 +127,7 @@ describe("unified usage telemetry", () => {
 			firstRunTs: 1,
 			cost: 0,
 			epoch: 1,
+			lastRunId: 1,
 			last: {
 				id: 1,
 				botId: "A",
@@ -170,6 +171,137 @@ describe("unified usage telemetry", () => {
 		);
 	});
 
+	test("hides empty system/tool legend rows, sums percents to 100.0, and renders local time", () => {
+		const stats: BotStats = {
+			runs: 1,
+			contextTokens: 3_000,
+			cacheRead: 0,
+			cacheWrite: 0,
+			cacheMiss: 3_000,
+			estimatedCacheRuns: 0,
+			outputTokens: 10,
+			speedOutputTokens: 10,
+			reasoningTokens: 0,
+			totalLatencyMs: 0,
+			latencySamples: 0,
+			totalThinkingMs: 0,
+			thinkingSamples: 0,
+			totalSendMs: 0,
+			sendSamples: 0,
+			firstRunTs: 1_786_251_069_000,
+			cost: 0,
+			epoch: 1,
+			lastRunId: 1,
+			last: {
+				id: 1,
+				botId: "A",
+				ts: 1_786_251_069_000,
+				model: "m",
+				epoch: 1,
+				contextTokens: 3_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cacheMiss: 3_000,
+				outputTokens: 10,
+				reasoningTokens: 0,
+				latencyMs: null,
+				contextBreakdown: { system: 0, tools: 0, compactedHistory: 1_000, messages: 2_000 },
+				cost: 0,
+			},
+		};
+		const view = buildBotStatusView(
+			{ id: "A", name: "A", provider: "p", model: "m", reasoningEffort: "off", routingP: 0, samplingCooldownMs: 0 },
+			stats,
+			undefined,
+			9_000,
+		);
+		const fields = botStatusFields(view, true);
+		const legend =
+			fields
+				.find((field) => field.key === "context_breakdown")
+				?.value.split("\n")
+				.slice(1) ?? [];
+		expect(legend.map((line) => line.slice(0, 2))).toEqual(["🟫", "🟦", "🟩"]);
+		const percents = legend.map((line) => Number(/([\d.]+)%`$/.exec(line)?.[1]));
+		// Exact thirds are 11.1 / 22.2 / 66.7 only after largest-remainder rounding (naive rounding gives 100.0 - 0.1).
+		expect(percents).toEqual([11.1, 22.2, 66.7]);
+		expect(percents.reduce((sum, value) => sum + value, 0)).toBeCloseTo(100, 6);
+		expect(botStatusFields(view).find((field) => field.key === "context_breakdown")?.value).toBe(
+			"S 0.0% · T 0.0% · C 11.1% · M 22.2% · F 66.7%",
+		);
+		// TZ is pinned to Asia/Singapore at the top of this file: 1_786_251_069_000 is 2026-08-09T04:51:09Z = 12:51:09 +08.
+		expect(fields.find((field) => field.key === "latest_request")?.value).toStartWith("2026-08-09 12:51:09 · ");
+		expect(fields.find((field) => field.key === "lifetime")?.value).toContain("since 2026-08-09 12:51:09");
+	});
+
+	test("footer shows unknown context when a compaction is newer than the latest main run", () => {
+		const last: UsageRun = {
+			id: 5,
+			botId: "A",
+			ts: 10,
+			model: "m",
+			epoch: 2,
+			contextTokens: 50_000,
+			cacheRead: 0,
+			cacheWrite: 0,
+			cacheMiss: 50_000,
+			outputTokens: 100,
+			reasoningTokens: 0,
+			latencyMs: 1_000,
+			cost: 0.01,
+		};
+		const base: BotStats = {
+			runs: 1,
+			contextTokens: 50_000,
+			cacheRead: 0,
+			cacheWrite: 0,
+			cacheMiss: 50_000,
+			estimatedCacheRuns: 0,
+			outputTokens: 100,
+			speedOutputTokens: 100,
+			reasoningTokens: 0,
+			totalLatencyMs: 1_000,
+			latencySamples: 1,
+			totalThinkingMs: 0,
+			thinkingSamples: 1,
+			totalSendMs: 0,
+			sendSamples: 0,
+			firstRunTs: 10,
+			cost: 0.01,
+			epoch: 2,
+			lastRunId: 5,
+			last,
+		};
+		const bot = {
+			id: "A",
+			name: "A",
+			provider: "p",
+			model: "m",
+			reasoningEffort: "off",
+			routingP: 1,
+			samplingCooldownMs: 0,
+		} as const;
+		const host = { modelRegistry: { getAvailable: () => [] }, model: undefined };
+		const runtime: RuntimeControlSnapshot = {
+			state: "idle",
+			epoch: 2,
+			provider: "p",
+			model: "m",
+			reasoningEffort: "off",
+			contextWindow: 100_000,
+			routingP: 1,
+			samplingCooldownMs: 0,
+			lastCompact: null,
+		};
+		expect(telegramFooterUsage("A", { A: base }, { A: runtime }, [bot], host)?.contextPercent).toBe(50);
+		// A live compaction run (id 6) was folded into totals but must not keep the pre-compaction percent.
+		const compacted: BotStats = { ...base, runs: 2, lastRunId: 6, last };
+		expect(telegramFooterUsage("A", { A: compacted }, { A: runtime }, [bot], host)?.contextPercent).toBeNull();
+		// The next main run (id 7) makes the context known again.
+		const resumed: BotStats = { ...compacted, lastRunId: 7, last: { ...last, id: 7, contextTokens: 20_000 } };
+		expect(telegramFooterUsage("A", { A: resumed }, { A: runtime }, [bot], host)?.contextPercent).toBe(20);
+	});
+
 	test("uses live session context and hides a previous epoch breakdown", () => {
 		const stats: BotStats = {
 			runs: 1,
@@ -190,6 +322,7 @@ describe("unified usage telemetry", () => {
 			firstRunTs: 1,
 			cost: 0,
 			epoch: 43,
+			lastRunId: 1,
 			last: {
 				id: 1,
 				botId: "B",
@@ -353,7 +486,9 @@ describe("unified usage telemetry", () => {
 			expect(piStatus).toContain("context_current=777 / 128,000 (0.6%)");
 			expect(piStatus).toContain("cache_and_cost=CH 46.7% · $0.1500");
 			expect(footerLines[0]).toBe("~/project (main) • ops");
-			expect(footerLines[1]).toStartWith("↑750 ↓170 R700 W50 CH46.7% $0.1500 0.8%/128k (auto)");
+			// The compaction run is newer than the last main run, so the footer context is unknown
+			// until the next main response (docs/telemetry.md).
+			expect(footerLines[1]).toStartWith("↑750 ↓170 R700 W50 CH46.7% $0.1500 ?/128k (auto)");
 			expect(footerLines[1]).toEndWith("(test) chat-model • high");
 			expect(visibleWidth(footerLines[1]!)).toBe(100);
 			expect(footerLines).toHaveLength(2);
@@ -499,7 +634,9 @@ describe("unified usage telemetry", () => {
 			socketPath,
 			new Map([["A", "bot A"]]),
 			new Map([["A", 1]]),
-			null,
+			async () => {
+				throw new Error("manual send unused");
+			},
 			() => runtimeStatus,
 		);
 		ipc.start();
@@ -542,11 +679,15 @@ describe("unified usage telemetry", () => {
 				cost: 0.025,
 				compaction: true,
 			};
+			// A push whose id is already inside the snapshot (`id <= lastId`) must not be folded a second time.
+			ipc.broadcastUsage({ ...compaction, id: mainId, contextTokens: 999, compaction: false });
 			ipc.broadcastUsage(compaction);
 			const stats = await withTimeout(updated, "live compaction stats timed out");
 			expect(stats.runs).toBe(2);
 			expect(stats.contextTokens).toBe(1_500);
 			expect(stats.last?.id).toBe(mainId);
+			// The daemon reports the newest run id so the footer can detect a compaction after `last`.
+			expect(stats.lastRunId).toBe(mainId + 1);
 		} finally {
 			client.dispose();
 			ipc.stop();

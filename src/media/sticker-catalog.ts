@@ -30,10 +30,16 @@ export interface CatalogSticker {
 
 export type StickerMime = "image/webp" | "application/x-tgsticker" | "video/webm";
 
-function stickerMime(sticker: { is_animated?: boolean; is_video?: boolean }): StickerMime {
+/** Telegram sticker flags → stored MIME; shared by catalog loading and message normalization. */
+export function stickerMime(sticker: { is_animated?: boolean; is_video?: boolean }): StickerMime {
 	if (sticker.is_video) return "video/webm";
 	if (sticker.is_animated) return "application/x-tgsticker";
 	return "image/webp";
+}
+
+/** short_id from rowid: stable, unique, race-free; a no-op once assigned. */
+export function assignStickerShortId(db: Database, fileUniqueId: string): void {
+	db.query("UPDATE media SET short_id = 's' || rowid WHERE file_unique_id = ? AND short_id IS NULL").run(fileUniqueId);
 }
 
 /** Fetch one Telegram sticker set (public sets work for any bot token). */
@@ -73,6 +79,31 @@ export async function ensureStickerCatalog(
 ): Promise<{ total: number; sendable: number; missingMapping: number; truncated: boolean }> {
 	let total = 0;
 	let truncated = false;
+	const upsertMedia = db.query(
+		`INSERT INTO media (file_unique_id, kind, mime, sticker_set, sticker_emoji, width, height)
+		 VALUES (?, 'sticker', ?, ?, ?, ?, ?)
+		 ON CONFLICT(file_unique_id) DO UPDATE SET
+		   mime = excluded.mime,
+		   sticker_set = COALESCE(excluded.sticker_set, media.sticker_set),
+		   sticker_emoji = COALESCE(excluded.sticker_emoji, media.sticker_emoji),
+		   width = COALESCE(excluded.width, media.width),
+		   height = COALESCE(excluded.height, media.height)`,
+	);
+	const upsertMapping = db.query(
+		"INSERT OR IGNORE INTO media_file_ids (bot_id, file_id, file_unique_id) VALUES (?, ?, ?)",
+	);
+	const persistSet = db.transaction((setName: string, stickers: CatalogSticker[]) => {
+		for (const s of stickers) {
+			if (total >= STICKER_CATALOG_MAX) {
+				truncated = true;
+				break;
+			}
+			upsertMedia.run(s.file_unique_id, s.mime, setName, s.emoji, s.width ?? null, s.height ?? null);
+			upsertMapping.run(botId, s.file_id, s.file_unique_id);
+			assignStickerShortId(db, s.file_unique_id);
+			total++;
+		}
+	});
 	for (const setName of sets) {
 		if (total >= STICKER_CATALOG_MAX) {
 			truncated = true;
@@ -89,38 +120,7 @@ export async function ensureStickerCatalog(
 			});
 			continue;
 		}
-		for (const s of stickers) {
-			if (total >= STICKER_CATALOG_MAX) {
-				truncated = true;
-				break;
-			}
-			db.query(
-				`INSERT INTO media (file_unique_id, kind, mime, sticker_set, sticker_emoji, width, height)
-				 VALUES (?, 'sticker', ?, ?, ?, ?, ?)
-				 ON CONFLICT(file_unique_id) DO UPDATE SET
-				   mime = excluded.mime,
-				   sticker_set = COALESCE(excluded.sticker_set, media.sticker_set),
-				   sticker_emoji = COALESCE(excluded.sticker_emoji, media.sticker_emoji),
-				   width = COALESCE(excluded.width, media.width),
-				   height = COALESCE(excluded.height, media.height)`,
-			).run(s.file_unique_id, s.mime, setName, s.emoji, s.width ?? null, s.height ?? null);
-			db.query("INSERT OR IGNORE INTO media_file_ids (bot_id, file_id, file_unique_id) VALUES (?, ?, ?)").run(
-				botId,
-				s.file_id,
-				s.file_unique_id,
-			);
-			// short_id from rowid: stable, unique, race-free
-			const row = db.query("SELECT rowid FROM media WHERE file_unique_id = ?").get(s.file_unique_id) as {
-				rowid: number;
-			} | null;
-			if (row) {
-				db.query("UPDATE media SET short_id = ? WHERE file_unique_id = ? AND short_id IS NULL").run(
-					`s${row.rowid}`,
-					s.file_unique_id,
-				);
-			}
-			total++;
-		}
+		persistSet(setName, stickers);
 	}
 	if (truncated) {
 		log.warn("sticker_catalog", "catalog_truncated", { bot_id: botId, limit: STICKER_CATALOG_MAX });
@@ -274,12 +274,7 @@ export function recentContextStickerCandidates(
 		if (seen.has(row.file_unique_id)) continue;
 		seen.add(row.file_unique_id);
 		const shortId = row.short_id ?? `s${row.rowid}`;
-		if (!row.short_id) {
-			db.query("UPDATE media SET short_id = ? WHERE file_unique_id = ? AND short_id IS NULL").run(
-				shortId,
-				row.file_unique_id,
-			);
-		}
+		if (!row.short_id) assignStickerShortId(db, row.file_unique_id);
 		lines.push(stickerLine(shortId, row.sticker_emoji, stickerDescription(row.vision)));
 		if (lines.length >= boundedLimit) break;
 	}

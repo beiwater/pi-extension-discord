@@ -45,6 +45,7 @@ function makeConfig(bot: BotConfig): AppConfig {
 		dataDir: "/tmp/unused",
 		dbPath: "/tmp/unused/agent.db",
 		groupPeerId: 4402809405,
+		groupChatId: CHAT_ID,
 		bots: [bot],
 		tinyfishApiKey: "",
 		auxiliaryVisualModel: "test/vision:off",
@@ -87,6 +88,7 @@ function setup(): Harness {
 	const sent: string[] = [];
 	const rt = new BotRuntime(db, bot, config, modelRuntime, {
 		chatActionSender: async () => {},
+		videoTranscoder: { ffmpeg: false, ffprobe: false },
 	});
 	(rt as any).model = fakeModel();
 	const sessionManager = SessionManager.inMemory("/tmp/unused");

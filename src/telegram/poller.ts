@@ -17,8 +17,8 @@ export class Poller {
 	private api: BotApi;
 	private botId: string;
 	private db: Database;
-	private groupPeerId: number;
-	private onMessage: MessageHandler | null;
+	private groupChatId: number;
+	private onMessage: MessageHandler;
 	private emitMediaUpdates: boolean;
 	private stopped = false;
 	private readonly abort = new AbortController();
@@ -27,15 +27,15 @@ export class Poller {
 		db: Database,
 		botId: string,
 		token: string,
-		groupPeerId: number,
-		onMessage: MessageHandler | null = null,
+		groupChatId: number,
+		onMessage: MessageHandler,
 		/** Vision mode only: replay persisted media descriptions as media_update events. */
-		emitMediaUpdates = true,
+		emitMediaUpdates: boolean,
 	) {
 		this.db = db;
 		this.botId = botId;
 		this.api = new BotApi(token);
-		this.groupPeerId = groupPeerId;
+		this.groupChatId = groupChatId;
 		this.onMessage = onMessage;
 		this.emitMediaUpdates = emitMediaUpdates;
 	}
@@ -97,11 +97,8 @@ export class Poller {
 				const updateId = (update as { update_id: number }).update_id;
 				try {
 					this.db.transaction(() => {
-						const result = ingestUpdate(this.db, this.botId, update, this.groupPeerId, this.emitMediaUpdates);
-						if (
-							this.onMessage &&
-							(result.kind === "inserted" || result.kind === "edited" || result.kind === "enriched")
-						) {
+						const result = ingestUpdate(this.db, this.botId, update, this.groupChatId, this.emitMediaUpdates);
+						if (result.kind === "inserted" || result.kind === "edited" || result.kind === "enriched") {
 							this.db
 								.query(`INSERT INTO pending_telegram_dispatch
                                 (bot_id, update_id, kind, chat_id, message_id, route_version) VALUES (?, ?, ?, ?, ?, ?)`)
@@ -152,7 +149,6 @@ export class Poller {
 			.get(this.botId) as (IngestResult & { updateId: number; json: string }) | null;
 		if (!pending) return true;
 		try {
-			if (!this.onMessage) throw new Error("routing handler unavailable");
 			const { updateId, json, ...result } = pending;
 			await this.onMessage(result, JSON.parse(json), this.botId);
 			this.db

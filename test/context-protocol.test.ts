@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { findCutPoint, SessionManager } from "@earendil-works/pi-coding-agent";
+import { findCutPoint, SessionManager, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import {
 	buildContextFingerprint,
@@ -12,7 +12,7 @@ import {
 	type ContextFingerprintInput,
 } from "../src/agent/context-fingerprint.ts";
 import {
-	configureBotModelRuntime,
+	assertBotModelConfigured,
 	createInstalledPiModelRuntime,
 	inspectModelReasoning,
 } from "../src/agent/model-runtime.ts";
@@ -115,7 +115,8 @@ describe("Pi context protocol", () => {
 			getModel: (provider: string, modelId: string) =>
 				provider === "fixture" && modelId === "fixture-reasoning-model" ? model : undefined,
 			hasConfiguredAuth: () => true,
-		};
+			getProviderAuthStatus: () => ({ configured: true, source: "test" }),
+		} as unknown as ModelRuntime;
 
 		expect(inspectModelReasoning(model, "medium")).toEqual({
 			provider: "fixture",
@@ -125,27 +126,26 @@ describe("Pi context protocol", () => {
 			supported: ["off", "low", "high", "max"],
 			valid: false,
 		});
-		await expect(
-			configureBotModelRuntime(
-				{
-					provider: "fixture",
-					model: "fixture-reasoning-model",
-					thinkingLevel: "medium",
-					purpose: "bot:A",
-				},
+		let rejected: unknown;
+		try {
+			assertBotModelConfigured(
+				{ provider: "fixture", model: "fixture-reasoning-model", thinkingLevel: "medium", purpose: "bot:A" },
 				runtime,
-			),
-		).rejects.toMatchObject({
+			);
+		} catch (error) {
+			rejected = error;
+		}
+		expect(rejected).toMatchObject({
 			category: "unsupported_reasoning_effort",
 			purpose: "bot:A",
 			reasoning: { requested: "medium", effective: "high", supported: ["off", "low", "high", "max"] },
 		});
-		expect(
-			await configureBotModelRuntime(
+		expect(() =>
+			assertBotModelConfigured(
 				{ provider: "fixture", model: "fixture-reasoning-model", thinkingLevel: "high" },
 				runtime,
 			),
-		).toBe(runtime);
+		).not.toThrow();
 	});
 
 	test("fingerprint changes and missing files prevent session resume", () => {

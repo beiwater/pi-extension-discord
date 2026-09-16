@@ -196,6 +196,8 @@ export interface AppConfig {
 	dataDir: string;
 	dbPath: string;
 	groupPeerId: number;
+	/** `-100<groupPeerId>`: the one chat id ingestion accepts and every send targets. */
+	groupChatId: number;
 	bots: BotConfig[];
 	tinyfishApiKey: string;
 	auxiliaryVisualModel: string;
@@ -289,6 +291,51 @@ export interface RawConfig {
 	message_event_retention_days?: unknown;
 	telegram_admins?: unknown;
 	bots?: unknown;
+}
+
+/** Telegram supergroup chat id (`-100<peer>`), the only form ingestion accepts and sends target. */
+export function groupChatIdFor(groupPeerId: number): number {
+	return Number(`-100${groupPeerId}`);
+}
+
+/**
+ * One range table for every numeric knob that exists at both the deployment level and the
+ * per-bot level, so a per-bot override can never bypass the deployment bounds.
+ */
+const NUMERIC_RANGES = {
+	compaction_threshold: [1, Number.MAX_SAFE_INTEGER],
+	compaction_keep_recent: [1, Number.MAX_SAFE_INTEGER],
+	max_suffix_tokens: [512, Number.MAX_SAFE_INTEGER],
+	max_message_tokens: [128, Number.MAX_SAFE_INTEGER],
+	sampling_cooldown_ms: [0, Number.MAX_SAFE_INTEGER],
+	provider_timeout_ms: [1_000, 3_600_000],
+	provider_retries: [0, 5],
+	context_image_budget_bytes: [100_000, 100_000_000],
+	context_window: [MIN_COMPACTION_RESERVE * 2, 10_000_000],
+	telemetry_retention_days: [1, 3650],
+	raw_update_retention_days: [1, 3650],
+	message_event_retention_days: [1, 3650],
+} as const satisfies Record<string, readonly [number, number]>;
+type NumericKey = keyof typeof NUMERIC_RANGES;
+const BOT_NUMERIC_KEYS = [
+	"compaction_threshold",
+	"compaction_keep_recent",
+	"max_suffix_tokens",
+	"max_message_tokens",
+	"sampling_cooldown_ms",
+	"provider_timeout_ms",
+	"provider_retries",
+	"context_image_budget_bytes",
+] as const satisfies readonly NumericKey[];
+
+function checkNumericRange(errors: string[], key: NumericKey, value: unknown, at?: string): void {
+	if (value === undefined) return;
+	const [min, max] = NUMERIC_RANGES[key];
+	if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
+		errors.push(
+			`[config] ${at ? `${at}.` : ""}${key}: expected a number in [${min}, ${max}], got ${JSON.stringify(value)}`,
+		);
+	}
 }
 
 const TYPESCRIPT_CONFIG = "telegram.config.ts";
@@ -398,10 +445,7 @@ export function loadBotConfig(rootDir: string, env: Record<string, string>, conf
 		if (p !== undefined && (typeof p !== "number" || !Number.isFinite(p) || p < 0 || p > 1)) {
 			errors.push(`[config] ${at}.routing_p: expected number in [0, 1], got ${JSON.stringify(p)}`);
 		}
-		const cooldown = b.sampling_cooldown_ms;
-		if (cooldown !== undefined && (typeof cooldown !== "number" || !Number.isFinite(cooldown) || cooldown < 0)) {
-			errors.push(`[config] ${at}.sampling_cooldown_ms: expected finite number >= 0, got ${JSON.stringify(cooldown)}`);
-		}
+		for (const key of BOT_NUMERIC_KEYS) checkNumericRange(errors, key, b[key], at);
 		for (const key of ["provider", "model"] as const) {
 			const value = b[key];
 			if (value !== undefined && (typeof value !== "string" || value.trim() === "")) {
@@ -425,23 +469,6 @@ export function loadBotConfig(rootDir: string, env: Record<string, string>, conf
 			errors.push(
 				`[config] ${at}.cache_retention: expected none, short, or long, got ${JSON.stringify(b.cache_retention)}`,
 			);
-		}
-		for (const key of ["provider_timeout_ms", "provider_retries", "context_image_budget_bytes"] as const) {
-			const v = b[key];
-			if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v) || v < 0)) {
-				errors.push(`[config] ${at}.${key}: expected finite number >= 0, got ${JSON.stringify(v)}`);
-			}
-		}
-		for (const key of [
-			"compaction_threshold",
-			"compaction_keep_recent",
-			"max_suffix_tokens",
-			"max_message_tokens",
-		] as const) {
-			const v = b[key];
-			if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v) || v <= 0)) {
-				errors.push(`[config] ${at}.${key}: expected positive finite number, got ${JSON.stringify(v)}`);
-			}
 		}
 		if (b.tools !== undefined) {
 			const t = b.tools;
@@ -473,21 +500,7 @@ export function loadBotConfig(rootDir: string, env: Record<string, string>, conf
 	if (sum > 1) {
 		errors.push(`[config] bots routing_p: probabilities must sum to <= 1, got ${sum.toFixed(3)}`);
 	}
-	// global numeric params
-	for (const key of [
-		"compaction_threshold",
-		"compaction_keep_recent",
-		"max_suffix_tokens",
-		"max_message_tokens",
-		"telemetry_retention_days",
-		"raw_update_retention_days",
-		"message_event_retention_days",
-	] as const) {
-		const v = raw[key];
-		if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v) || v <= 0)) {
-			errors.push(`[config] ${key}: expected positive finite number, got ${JSON.stringify(v)}`);
-		}
-	}
+	for (const key of Object.keys(NUMERIC_RANGES) as NumericKey[]) checkNumericRange(errors, key, raw[key]);
 	if (raw.media !== undefined) {
 		if (raw.media == null || typeof raw.media !== "object" || Array.isArray(raw.media)) {
 			errors.push(`[config] media: expected object`);
@@ -605,6 +618,7 @@ export interface DebugDeploymentIdentity {
 	dataDir: string;
 	dbPath: string;
 	groupPeerId: number;
+	groupChatId: number;
 	visionEnabled: boolean;
 	auxiliaryVisualModel: string;
 	contextWindow: number;
@@ -624,6 +638,45 @@ export interface DebugDeploymentIdentity {
 	}>;
 }
 
+/**
+ * Config-file-only bot fields shared by the production loader and the offline debug identity.
+ * Never consults Pi defaults or secrets: provider/model/reasoning stay null when the file omits them.
+ */
+function botOverrides(rootDir: string, raw: RawConfig, bot: RawBotConfig) {
+	const id = typeof bot.id === "string" ? bot.id.trim() : "";
+	const tools = (bot.tools ?? {}) as Record<string, unknown>;
+	const retention = (value: unknown): "none" | "short" | "long" | null =>
+		value === "none" || value === "short" || value === "long" ? value : null;
+	return {
+		id,
+		name: typeof bot.name === "string" && bot.name ? bot.name : id,
+		personaPath: typeof bot.persona_path === "string" ? resolvePath(rootDir, bot.persona_path) : "",
+		provider:
+			typeof bot.provider === "string" ? bot.provider.trim() : typeof raw.provider === "string" ? raw.provider : null,
+		model: typeof bot.model === "string" ? bot.model.trim() : typeof raw.model === "string" ? raw.model : null,
+		reasoningEffort: isPiThinkingLevel(bot.reasoning_effort)
+			? bot.reasoning_effort
+			: isPiThinkingLevel(raw.reasoning_effort)
+				? raw.reasoning_effort
+				: null,
+		compactionModel:
+			typeof bot.compaction_model === "string"
+				? canonicalPiModelReference(bot.compaction_model)!
+				: typeof raw.compaction_model === "string"
+					? canonicalPiModelReference(raw.compaction_model)!
+					: DEFAULT_COMPACTION_MODEL,
+		cacheRetention: retention(bot.cache_retention) ?? retention(raw.cache_retention) ?? "short",
+		tools: {
+			send: tools.send !== false,
+			search: tools.search === true,
+			runJs: tools.run_js === true,
+		},
+		stickerSets: Array.isArray(bot.sticker_sets)
+			? bot.sticker_sets.filter((s): s is string => typeof s === "string")
+			: [],
+	};
+}
+
 /** Read only non-secret deployment identity for offline diagnostics; never resolves Pi auth/model defaults or token env values. */
 export function loadDebugDeploymentIdentity(rootDir: string): DebugDeploymentIdentity {
 	const env: Record<string, string> = { ...parseEnvFile(join(rootDir, ".env")) };
@@ -631,46 +684,7 @@ export function loadDebugDeploymentIdentity(rootDir: string): DebugDeploymentIde
 	const raw = loadBotConfig(rootDir, env);
 	const groupPeerId = normalizePeerId(String(raw.group_peer_id ?? ""));
 	const rawBots = Array.isArray(raw.bots) ? (raw.bots as RawBotConfig[]) : [];
-	const defaultCompactionModel =
-		typeof raw.compaction_model === "string"
-			? canonicalPiModelReference(raw.compaction_model)!
-			: DEFAULT_COMPACTION_MODEL;
-	const bots = rawBots.map((bot) => {
-		const id = typeof bot.id === "string" ? bot.id.trim() : "";
-		const tools = (bot.tools ?? {}) as Record<string, unknown>;
-		return {
-			id,
-			name: typeof bot.name === "string" && bot.name ? bot.name : id,
-			personaPath: typeof bot.persona_path === "string" ? resolvePath(rootDir, bot.persona_path) : "",
-			provider:
-				typeof bot.provider === "string" ? bot.provider : typeof raw.provider === "string" ? raw.provider : null,
-			model: typeof bot.model === "string" ? bot.model : typeof raw.model === "string" ? raw.model : null,
-			reasoningEffort:
-				typeof bot.reasoning_effort === "string"
-					? bot.reasoning_effort
-					: typeof raw.reasoning_effort === "string"
-						? raw.reasoning_effort
-						: null,
-			compactionModel:
-				typeof bot.compaction_model === "string"
-					? canonicalPiModelReference(bot.compaction_model)!
-					: defaultCompactionModel,
-			cacheRetention:
-				typeof bot.cache_retention === "string"
-					? bot.cache_retention
-					: typeof raw.cache_retention === "string"
-						? raw.cache_retention
-						: "short",
-			tools: {
-				send: tools.send !== false,
-				search: tools.search === true,
-				runJs: tools.run_js === true,
-			},
-			stickerSets: Array.isArray(bot.sticker_sets)
-				? bot.sticker_sets.filter((s): s is string => typeof s === "string")
-				: [],
-		};
-	});
+	const bots = rawBots.map((bot) => botOverrides(rootDir, raw, bot));
 	const botIds = bots.map((bot) => bot.id);
 	if (!Number.isFinite(groupPeerId) || botIds.length === 0 || botIds.some((id) => !/^[A-Za-z0-9_-]+$/.test(id))) {
 		throw new ConfigError(["[debug] deployment identity is invalid"]);
@@ -684,6 +698,7 @@ export function loadDebugDeploymentIdentity(rootDir: string): DebugDeploymentIde
 		dataDir,
 		dbPath: typeof raw.db_path === "string" ? resolvePath(rootDir, raw.db_path) : join(dataDir, "agent.db"),
 		groupPeerId,
+		groupChatId: groupChatIdFor(groupPeerId),
 		visionEnabled: rawVision?.enabled === true,
 		auxiliaryVisualModel:
 			typeof raw.auxiliary_visual_model === "string"
@@ -724,15 +739,10 @@ export function loadConfig(rootDir: string, options: LoadConfigOptions = {}): Ap
 			: { provider: undefined, model: undefined, thinkingLevel: "medium" as const });
 	const errors: string[] = [];
 
-	const num = (key: string, fallback: number, min: number, max: number): number => {
-		const v = (raw as Record<string, unknown>)[key];
-		if (v === undefined) return fallback;
-		const n = Number(v);
-		if (!Number.isFinite(n) || n < min || n > max) {
-			errors.push(`[config] ${key}: expected a number in [${min}, ${max}], got ${JSON.stringify(v)}`);
-			return fallback;
-		}
-		return n;
+	// loadBotConfig already validated every NUMERIC_RANGES key; absent keys take defaults.
+	const num = (key: NumericKey, fallback: number): number => {
+		const v = raw[key];
+		return typeof v === "number" ? v : fallback;
 	};
 	const needEnv = (key: string, label: string): string => {
 		const v = env[key];
@@ -758,21 +768,14 @@ export function loadConfig(rootDir: string, options: LoadConfigOptions = {}): Ap
 				? undefined
 				: piDefaults.model;
 	const defaultEffort = isPiThinkingLevel(raw.reasoning_effort) ? raw.reasoning_effort : "off";
-	const defaultThreshold = num("compaction_threshold", 32_768, 1, Number.MAX_SAFE_INTEGER);
-	const defaultKeepRecent = num("compaction_keep_recent", 1, 1, Number.MAX_SAFE_INTEGER);
-	const defaultCompactionModel =
-		typeof raw.compaction_model === "string"
-			? canonicalPiModelReference(raw.compaction_model)!
-			: DEFAULT_COMPACTION_MODEL;
-	const defaultCacheRetention = (["none", "short", "long"] as const).includes(raw.cache_retention as never)
-		? (raw.cache_retention as "none" | "short" | "long")
-		: "short";
-	const defaultMaxSuffixTokens = num("max_suffix_tokens", 12_000, 512, Number.MAX_SAFE_INTEGER);
-	const defaultMaxMessageTokens = num("max_message_tokens", 4_096, 128, Number.MAX_SAFE_INTEGER);
-	const defaultSamplingCooldown = num("sampling_cooldown_ms", 2000, 0, Number.MAX_SAFE_INTEGER);
-	const defaultProviderTimeoutMs = num("provider_timeout_ms", 300_000, 1_000, 3_600_000);
-	const defaultProviderRetries = num("provider_retries", 2, 0, 5);
-	const defaultContextImageBudgetBytes = num("context_image_budget_bytes", 10_000_000, 100_000, 100_000_000);
+	const defaultThreshold = num("compaction_threshold", 32_768);
+	const defaultKeepRecent = num("compaction_keep_recent", 1);
+	const defaultMaxSuffixTokens = num("max_suffix_tokens", 12_000);
+	const defaultMaxMessageTokens = num("max_message_tokens", 4_096);
+	const defaultSamplingCooldown = num("sampling_cooldown_ms", 2000);
+	const defaultProviderTimeoutMs = num("provider_timeout_ms", 300_000);
+	const defaultProviderRetries = num("provider_retries", 2);
+	const defaultContextImageBudgetBytes = num("context_image_budget_bytes", 10_000_000);
 	const botList = rawBots;
 	const telegramAdmins = Array.isArray(raw.telegram_admins)
 		? raw.telegram_admins.map((value) => normalizeTelegramAdmin(value)!)
@@ -783,12 +786,12 @@ export function loadConfig(rootDir: string, options: LoadConfigOptions = {}): Ap
 		);
 	}
 
-	const contextWindow = num("context_window", DEFAULT_CONTEXT_WINDOW, MIN_COMPACTION_RESERVE * 2, 10_000_000);
+	const contextWindow = num("context_window", DEFAULT_CONTEXT_WINDOW);
 	const maxCompactionThreshold = contextWindow - MIN_COMPACTION_RESERVE;
 
 	const bots: BotConfig[] = botList.map((b) => {
 		const tokenEnv = b.token_env as string;
-		const toolsRaw = (b.tools ?? {}) as Record<string, unknown>;
+		const overrides = botOverrides(rootDir, raw, b);
 		const explicitProvider = typeof b.provider === "string" ? b.provider.trim() : undefined;
 		const provider = explicitProvider ?? defaultProvider ?? "";
 		const model =
@@ -812,24 +815,15 @@ export function loadConfig(rootDir: string, options: LoadConfigOptions = {}): Ap
 			);
 		}
 		return {
-			id: b.id as string,
-			name: typeof b.name === "string" && b.name ? b.name : (b.id as string),
+			...overrides,
 			token: env[tokenEnv] ?? "",
-			personaPath: resolvePath(rootDir, b.persona_path as string),
 			routingP: typeof b.routing_p === "number" ? b.routing_p : 0,
 			samplingCooldownMs: typeof b.sampling_cooldown_ms === "number" ? b.sampling_cooldown_ms : defaultSamplingCooldown,
 			provider,
 			model,
-			reasoningEffort: isPiThinkingLevel(b.reasoning_effort) ? b.reasoning_effort : defaultEffort,
+			reasoningEffort: overrides.reasoningEffort ?? defaultEffort,
 			compactionThreshold: effectiveThreshold,
 			compactionKeepRecent: typeof b.compaction_keep_recent === "number" ? b.compaction_keep_recent : defaultKeepRecent,
-			compactionModel:
-				typeof b.compaction_model === "string"
-					? canonicalPiModelReference(b.compaction_model)!
-					: defaultCompactionModel,
-			cacheRetention: (["none", "short", "long"] as const).includes(b.cache_retention as never)
-				? (b.cache_retention as "none" | "short" | "long")
-				: defaultCacheRetention,
 			providerTimeoutMs: typeof b.provider_timeout_ms === "number" ? b.provider_timeout_ms : defaultProviderTimeoutMs,
 			providerRetries: typeof b.provider_retries === "number" ? b.provider_retries : defaultProviderRetries,
 			contextImageBudgetBytes:
@@ -838,12 +832,6 @@ export function loadConfig(rootDir: string, options: LoadConfigOptions = {}): Ap
 					: defaultContextImageBudgetBytes,
 			maxSuffixTokens: typeof b.max_suffix_tokens === "number" ? b.max_suffix_tokens : defaultMaxSuffixTokens,
 			maxMessageTokens: typeof b.max_message_tokens === "number" ? b.max_message_tokens : defaultMaxMessageTokens,
-			tools: {
-				send: toolsRaw.send !== false,
-				search: toolsRaw.search === true,
-				runJs: toolsRaw.run_js === true,
-			},
-			stickerSets: Array.isArray(b.sticker_sets) ? (b.sticker_sets as string[]) : [],
 		};
 	});
 	const tinyfishApiKey = bots.some((bot) => bot.tools.search)
@@ -862,9 +850,9 @@ export function loadConfig(rootDir: string, options: LoadConfigOptions = {}): Ap
 		return typeof value === "number" ? value : fallback;
 	};
 	const retention: RetentionConfig = {
-		telemetryDays: num("telemetry_retention_days", 90, 1, 3650),
-		rawUpdateDays: num("raw_update_retention_days", 30, 1, 3650),
-		messageEventDays: num("message_event_retention_days", 365, 1, 3650),
+		telemetryDays: num("telemetry_retention_days", 90),
+		rawUpdateDays: num("raw_update_retention_days", 30),
+		messageEventDays: num("message_event_retention_days", 365),
 	};
 	if (errors.length > 0) throw new ConfigError(errors);
 
@@ -872,6 +860,7 @@ export function loadConfig(rootDir: string, options: LoadConfigOptions = {}): Ap
 		dataDir,
 		dbPath: typeof raw.db_path === "string" ? resolvePath(rootDir, raw.db_path) : join(dataDir, "agent.db"),
 		groupPeerId,
+		groupChatId: groupChatIdFor(groupPeerId),
 		bots,
 		tinyfishApiKey,
 		auxiliaryVisualModel:

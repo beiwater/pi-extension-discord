@@ -37,7 +37,7 @@ import { runTinyFishTool } from "../tools/search.ts";
 import { runJs } from "../tools/run-js.ts";
 import { contextMediaRefs, createContextImageResolver, ensureContextMedia } from "../media/context-media.ts";
 import { isVisionMedia, type MediaDownloadApi } from "../media/local-cache.ts";
-import { createPiVisionExecutor, ensureVision, type VisionExecutor, type VisionUpdateSink } from "../media/vision.ts";
+import { ensureVision, type VisionExecutor, type VisionUpdateSink } from "../media/vision.ts";
 import type { VisionScheduler } from "../media/vision-scheduler.ts";
 import {
 	ensureStickerCatalog,
@@ -70,7 +70,13 @@ import {
 	setSessionManifest,
 	type MessageEvent,
 } from "../db/message-events.ts";
-import { availableSuffixBudget, estimateProviderTokensUpperBound, packMessageEvents } from "./token-packer.ts";
+import {
+	availableSuffixBudget,
+	DEFAULT_REASONING_RESERVE,
+	DEFAULT_TOOL_FOLLOWUP_RESERVE,
+	estimateProviderTokensUpperBound,
+	packMessageEvents,
+} from "./token-packer.ts";
 import {
 	estimateCacheReadFromPrefix,
 	buildTelegramContextBlocks,
@@ -172,7 +178,7 @@ export class BotRuntime {
 	/** Last assistant message ended in error/abort; auto-compaction waits for a healthy turn. */
 	private lastTurnFailed = false;
 	private lastControlCompact: RuntimeControlSnapshot["lastCompact"] = null;
-	private readonly monotonicNow: () => number;
+	private readonly monotonicNow = () => performance.now();
 	private visibleMessageIds = new Set<number>();
 	private epoch = 1;
 	private runStartTs = 0;
@@ -203,9 +209,9 @@ export class BotRuntime {
 	private thinkingFinished = false;
 	private readonly visionScheduler: VisionScheduler | null;
 	private readonly typingLease: TelegramTypingLease;
-	private readonly videoTranscoder: VideoTranscoderAvailability | undefined;
+	private readonly videoTranscoder: VideoTranscoderAvailability;
 	/** Optional sink for TUI/live broadcasting of agent events. */
-	eventSink: ((kind: string, payload: unknown) => void) | null = null;
+	eventSink: ((event: { id: number; ts: number; kind: string; payload: unknown }) => void) | null = null;
 	/** Optional sink for messages this bot sent (poller echo dedupes them, so TUI needs this path). */
 	sentMessageSink: ((rawMsg: unknown) => void) | null = null;
 	/** Optional sink for llm_run telemetry (REQ-UI-0003: live usage push). */
@@ -225,14 +231,14 @@ export class BotRuntime {
 		config: AppConfig,
 		modelRuntime: ModelRuntime,
 		options: {
-			monotonicNow?: () => number;
+			/** Startup probe result; both media modes sample video frames through it. */
+			videoTranscoder: VideoTranscoderAvailability;
 			chatActionSender?: (signal: AbortSignal) => Promise<unknown>;
 			api?: BotApi;
 			botApis?: ReadonlyMap<string, MediaDownloadApi>;
 			visionExecutor?: VisionExecutor;
 			visionScheduler?: VisionScheduler;
-			videoTranscoder?: VideoTranscoderAvailability;
-		} = {},
+		},
 	) {
 		this.db = db;
 		this.bot = bot;
@@ -241,10 +247,9 @@ export class BotRuntime {
 		this.visionExecutor = options.visionExecutor ?? null;
 		this.visionScheduler = options.visionScheduler ?? null;
 		this.videoTranscoder = options.videoTranscoder;
-		this.monotonicNow = options.monotonicNow ?? (() => performance.now());
 		this.api = options.api ?? new BotApi(bot.token);
 		this.botApis = options.botApis ?? new Map([[bot.id, this.api]]);
-		const chatId = Number(`-100${config.groupPeerId}`);
+		const chatId = config.groupChatId;
 		this.typingLease = new TelegramTypingLease(
 			options.chatActionSender ?? ((signal) => this.api.sendChatAction(chatId, signal)),
 			{
@@ -274,7 +279,7 @@ export class BotRuntime {
 
 	async init(): Promise<void> {
 		const persona = readFileSync(this.bot.personaPath, "utf8");
-		const chatId = Number(`-100${this.config.groupPeerId}`);
+		const chatId = this.config.groupChatId;
 		// Catalog identity + format is pinned into the stable system prefix below.
 		if (this.bot.stickerSets.length > 0) {
 			await ensureStickerCatalog(this.db, this.api, this.bot.id, this.bot.stickerSets);
@@ -488,7 +493,7 @@ export class BotRuntime {
 	/** Recover the SQLite half of prior custom-message commits without parsing rendered text. */
 	private reconcileContextStateFromSession(): void {
 		if (!this.session) return;
-		const chatId = Number(`-100${this.config.groupPeerId}`);
+		const chatId = this.config.groupChatId;
 		const state = contextStateFromEntries(
 			this.session.sessionManager.buildContextEntries(),
 			getConsumedSeq(this.db, this.bot.id, chatId),
@@ -572,8 +577,6 @@ export class BotRuntime {
 						attempt: event.attempt,
 						delay_ms: event.delayMs,
 					});
-					break;
-				case "agent_end":
 					break;
 				case "tool_execution_start":
 					this.recordEvent("tool_call", { tool: event.toolName, args: event.args });
@@ -741,7 +744,7 @@ export class BotRuntime {
 				)
 			: [];
 		this.visibleMessageIds = new Set(kept);
-		const chatId = Number(`-100${this.config.groupPeerId}`);
+		const chatId = this.config.groupChatId;
 		replaceVisibleMessageIds(this.db, this.bot.id, chatId, this.epoch, kept);
 		this.recordEvent("compaction", { epoch: this.epoch, kept: kept.length });
 		this.lastControlCompact = { at: Date.now(), outcome: "ok" };
@@ -775,11 +778,8 @@ export class BotRuntime {
 			}
 			const keptIndex = branchEntries.findIndex((entry) => entry.id === prep.firstKeptEntryId);
 			const keptEntries = keptIndex >= 0 ? branchEntries.slice(keptIndex) : [];
-			const chatId = Number(`-100${this.config.groupPeerId}`);
+			const chatId = this.config.groupChatId;
 			const state = contextStateFromEntries(keptEntries, getConsumedSeq(this.db, this.bot.id, chatId));
-			const unresolvedReplyMessageIds = listReplyObligations(this.db, this.bot.id, chatId, MAX_OBLIGATION_SCAN).map(
-				(obligation) => obligation.messageId,
-			);
 			return {
 				compaction: {
 					summary: gen.summary,
@@ -790,7 +790,6 @@ export class BotRuntime {
 						version: TELEGRAM_CONTEXT_VERSION,
 						consumedSeq: state.consumedSeq,
 						visibleMessageIds: [...state.visible],
-						unresolvedReplyMessageIds,
 					},
 				},
 			};
@@ -870,7 +869,7 @@ export class BotRuntime {
 			db: this.db,
 			api: this.api,
 			botId: this.bot.id,
-			chatId: Number(`-100${this.config.groupPeerId}`),
+			chatId: this.config.groupChatId,
 			emitMediaUpdates: this.config.media.mode === "vision",
 			visibleMessageIds: this.visibleMessageIds,
 			triggerMessageId: this.currentTriggerMessageId,
@@ -942,7 +941,8 @@ export class BotRuntime {
 		this.typingLease.start();
 		this.flushPromise = this.flushLoop()
 			.catch((err) => {
-				const category = classifyPiProviderFailure(err);
+				// Flush failures are local (SQLite/session) — provider errors never reject the turn.
+				const category = errorCategory(err);
 				// R3: a failed flush only produces an error event; nothing escapes as an
 				// unhandled rejection. Uncommitted events are retried by later triggers.
 				try {
@@ -990,7 +990,7 @@ export class BotRuntime {
 	/** Read a bounded immutable event window, commit its cursor, and wake the agent. */
 	private async flush(): Promise<boolean> {
 		if (!this.session) return false;
-		const chatId = Number(`-100${this.config.groupPeerId}`);
+		const chatId = this.config.groupChatId;
 		const obligations = listReplyObligations(this.db, this.bot.id, chatId, MAX_OBLIGATION_SCAN);
 
 		const consumedSeq = getConsumedSeq(this.db, this.bot.id, chatId);
@@ -1051,8 +1051,8 @@ export class BotRuntime {
 			staticPrefixTokens: this.staticPrefixTokenEstimate,
 			maxSuffixTokens: this.bot.maxSuffixTokens,
 			outputReserve: Math.min(4096, this.model.maxTokens),
-			reasoningReserve: this.bot.reasoningEffort === "off" ? 0 : 4096,
-			toolFollowupReserve: this.bot.tools.search || this.bot.tools.runJs ? 6144 : 2048,
+			reasoningReserve: this.bot.reasoningEffort === "off" ? 0 : DEFAULT_REASONING_RESERVE,
+			toolFollowupReserve: this.bot.tools.search || this.bot.tools.runJs ? DEFAULT_TOOL_FOLLOWUP_RESERVE : 2048,
 		});
 		const packed = packMessageEvents(
 			this.db,
@@ -1195,7 +1195,7 @@ export class BotRuntime {
 
 	/** Schedule persisted direct replies after startup; committed rows reconcile idempotently. */
 	recoverReplyObligations(): TriggerResult | null {
-		const chatId = Number(`-100${this.config.groupPeerId}`);
+		const chatId = this.config.groupChatId;
 		const obligations = listReplyObligations(this.db, this.bot.id, chatId, MAX_OBLIGATION_SCAN);
 		if (obligations.length === 0) return null;
 		for (const obligation of obligations) {
@@ -1224,7 +1224,7 @@ export class BotRuntime {
 	/** Keep a control command/reply out of the current epoch; durable exclusion is audit-backed. */
 	consumeControlMessage(messageId: number): void {
 		if (!Number.isSafeInteger(messageId) || messageId <= 0) return;
-		const chatId = Number(`-100${this.config.groupPeerId}`);
+		const chatId = this.config.groupChatId;
 		removeReplyObligations(this.db, this.bot.id, [{ chatId, messageId }]);
 	}
 
@@ -1273,19 +1273,20 @@ export class BotRuntime {
 		if (this.flushing || this.running || this.controlCompacting || this.session.isStreaming) {
 			return { ok: false, code: "busy" };
 		}
+		// Pi's prepareCompaction returns nothing when the branch already ends in a compaction or
+		// has no discardable turn; check the structure instead of matching its error text.
+		const branch = this.session.sessionManager.getBranch();
+		if (branch.at(-1)?.type === "compaction" || !branch.some((entry) => entry.type === "message")) {
+			return { ok: false, code: "nothing_to_compact" };
+		}
 		this.controlCompacting = true;
 		try {
 			const result = await this.session.compact();
 			this.lastControlCompact = { at: Date.now(), outcome: "ok" };
 			return { ok: true, epoch: this.epoch, tokensBefore: result.tokensBefore };
-		} catch (error) {
+		} catch {
 			this.lastControlCompact = { at: Date.now(), outcome: "failed" };
-			const message = error instanceof Error ? error.message : String(error);
-			// Depends on Pi session.compact() error wording; re-check these strings when upgrading Pi.
-			return {
-				ok: false,
-				code: /Nothing to compact|Already compacted/.test(message) ? "nothing_to_compact" : "failed",
-			};
+			return { ok: false, code: "failed" };
 		} finally {
 			this.controlCompacting = false;
 			if (this.pendingTrigger && !this.stopping) {
@@ -1333,11 +1334,15 @@ export class BotRuntime {
 				while (next < pending.length) {
 					const fileUniqueId = pending[next++]!;
 					try {
-						await ensureContextMedia(this.db, this.api, this.bot.id, fileUniqueId, {
+						const prepared = await ensureContextMedia(this.db, this.api, this.bot.id, fileUniqueId, {
 							cacheDir: join(this.config.dataDir, "media"),
 							botApis: this.botApis,
 							videoTranscoder: this.videoTranscoder,
 						});
+						if (!prepared.ok) {
+							this.recordEvent("error", { stage: "context_media", category: prepared.outcome });
+							log.warn("context_media", "prepare_failed", { bot_id: this.bot.id, category: prepared.outcome });
+						}
 					} catch {
 						this.recordEvent("error", { stage: "context_media", category: "request_failed" });
 					}
@@ -1385,8 +1390,11 @@ export class BotRuntime {
 	}
 
 	private async ensureOneVision(fileUniqueId: string): Promise<void> {
+		// The daemon constructs and readiness-checks (assertPiVisionExecutorReady) the shared executor
+		// before Telegram starts; a missing executor here is a wiring bug, never a runtime fallback.
+		if (!this.visionExecutor) throw new Error("vision executor is required when vision is enabled");
 		try {
-			await ensureVision(this.db, this.api, this.bot.id, fileUniqueId, this.getVisionExecutor(), {
+			await ensureVision(this.db, this.api, this.bot.id, fileUniqueId, this.visionExecutor, {
 				cacheDir: join(this.config.dataDir, "media"),
 				onPersist: (fileUniqueId, text) => this.visionSink?.(fileUniqueId, text),
 				onTelemetry: (telemetry) => {
@@ -1404,16 +1412,9 @@ export class BotRuntime {
 		}
 	}
 
-	private getVisionExecutor(): VisionExecutor {
-		if (!this.visionExecutor) {
-			this.visionExecutor = createPiVisionExecutor(this.modelRuntime, this.config.auxiliaryVisualModel);
-		}
-		return this.visionExecutor;
-	}
-
 	private markVisible(ids: readonly number[]): void {
 		for (const id of ids) this.visibleMessageIds.add(id);
-		const chatId = Number(`-100${this.config.groupPeerId}`);
+		const chatId = this.config.groupChatId;
 		addVisibleMessageIds(this.db, this.bot.id, chatId, this.epoch, ids);
 	}
 
@@ -1431,11 +1432,12 @@ export class BotRuntime {
 				: { value: payload, activity_id: activity.activityId }
 			: payload;
 		if (grouped && ACTIVITY_DETAIL_EVENT_KINDS.has(kind)) activity.captureEvent(kind, payload);
-		this.db
+		const ts = Date.now();
+		const inserted = this.db
 			.query("INSERT INTO agent_events (bot_id, ts, kind, payload) VALUES (?, ?, ?, ?)")
-			.run(this.bot.id, Date.now(), kind, JSON.stringify(storedPayload));
-		if (grouped) this.emitAssistantActivity(Date.now());
-		else this.eventSink?.(kind, payload);
+			.run(this.bot.id, ts, kind, JSON.stringify(storedPayload));
+		if (grouped) this.emitAssistantActivity(ts);
+		else this.eventSink?.({ id: Number(inserted.lastInsertRowid), ts, kind, payload });
 	}
 
 	private recordUsage(

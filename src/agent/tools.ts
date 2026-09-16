@@ -17,10 +17,6 @@ export interface SearchParams {
 	url?: string;
 }
 
-export interface RunJsParams {
-	code: string;
-}
-
 export const SEND_SUCCESS_ACK = "ok";
 export const SEND_NO_RETRY_ACK = "no_retry";
 
@@ -110,11 +106,6 @@ export function toolProtocolHash(definitions: readonly ProviderToolProtocol[]): 
 			definitions.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters })),
 		),
 	);
-}
-
-/** Stable hash over the complete provider-visible tool protocol. */
-export function toolsHash(): string {
-	return toolProtocolHash(TOOL_DEFS);
 }
 
 /** Pi requires a structural tool result; a constant one-token ACK is cheaper than dynamic ids. */

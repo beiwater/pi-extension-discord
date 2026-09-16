@@ -67,36 +67,19 @@ export function bytesBucket<TopBand extends string>(bytes: number, topBand: TopB
 	return topBand;
 }
 
-export interface MediaCacheFileOps {
-	mkdir(path: string): void;
-	read(path: string): Uint8Array;
-	stat(path: string): { isFile(): boolean; size: number };
-	writeExclusive(path: string, bytes: Uint8Array): void;
-	rename(from: string, to: string): void;
-	remove(path: string): void;
+function writeExclusive(path: string, bytes: Uint8Array): void {
+	const fd = openSync(path, "wx", 0o600);
+	try {
+		writeFileSync(fd, bytes);
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
 }
 
-const defaultFileOps: MediaCacheFileOps = {
-	mkdir: (path) => mkdirSync(path, { recursive: true, mode: 0o700 }),
-	read: (path) => new Uint8Array(readFileSync(path)),
-	stat: (path) => statSync(path),
-	writeExclusive: (path, bytes) => {
-		const fd = openSync(path, "wx", 0o600);
-		try {
-			writeFileSync(fd, bytes);
-			fsyncSync(fd);
-		} finally {
-			closeSync(fd);
-		}
-	},
-	rename: renameSync,
-	remove: (path) => rmSync(path, { force: true }),
-};
-
 export interface EnsureLocalMediaOptions {
-	cacheDir?: string;
+	cacheDir: string;
 	signal?: AbortSignal;
-	fileOps?: MediaCacheFileOps;
 	/** Every configured Bot API, keyed by the same bot_id stored beside its file_id. */
 	botApis?: ReadonlyMap<string, MediaDownloadApi>;
 }
@@ -171,27 +154,22 @@ function downloadSource(
 	return null;
 }
 
-function isReadyPath(
-	path: string | null,
-	mimeForPath: (path: string) => unknown,
-	maxBytes: number,
-	fileOps: MediaCacheFileOps,
-): boolean {
+function isReadyPath(path: string | null, mimeForPath: (path: string) => unknown, maxBytes: number): boolean {
 	if (!path || !mimeForPath(path)) return false;
 	try {
-		const stat = fileOps.stat(path);
+		const stat = statSync(path);
 		return stat.isFile() && stat.size > 0 && stat.size <= maxBytes;
 	} catch {
 		return false;
 	}
 }
 
-export function isDisplayReadyPath(path: string | null, fileOps: MediaCacheFileOps = defaultFileOps): boolean {
-	return isReadyPath(path, staticMediaMimeForPath, MEDIA_CACHE_MAX_BYTES, fileOps);
+export function isDisplayReadyPath(path: string | null): boolean {
+	return isReadyPath(path, staticMediaMimeForPath, MEDIA_CACHE_MAX_BYTES);
 }
 
-export function isSourceReadyPath(path: string | null, fileOps: MediaCacheFileOps = defaultFileOps): boolean {
-	return isReadyPath(path, sourceMediaMimeForPath, MEDIA_DOWNLOAD_MAX_BYTES, fileOps);
+export function isSourceReadyPath(path: string | null): boolean {
+	return isReadyPath(path, sourceMediaMimeForPath, MEDIA_DOWNLOAD_MAX_BYTES);
 }
 
 /** Resolve a cache-relative source filename inside this deployment's media directory. */
@@ -213,11 +191,7 @@ export function resolveMediaCachePath(cacheDir: string, storedPath: string | nul
  * addressed by basename inside the configured cache directory; missing/unsupported entries are
  * cleared so the bounded display-media queue can acquire them again.
  */
-export function reconcileMediaCachePaths(
-	db: Database,
-	cacheDir: string,
-	fileOps: MediaCacheFileOps = defaultFileOps,
-): { migrated: number; invalidated: number } {
+export function reconcileMediaCachePaths(db: Database, cacheDir: string): { migrated: number; invalidated: number } {
 	const rows = db.query("SELECT file_unique_id, local_path FROM media WHERE local_path IS NOT NULL").all() as {
 		file_unique_id: string;
 		local_path: string;
@@ -228,7 +202,7 @@ export function reconcileMediaCachePaths(
 	const reconcile = db.transaction(() => {
 		for (const row of rows) {
 			const resolved = resolveMediaSourcePath(cacheDir, row.local_path);
-			if (resolved && isSourceReadyPath(resolved, fileOps)) {
+			if (resolved && isSourceReadyPath(resolved)) {
 				const canonical = basename(resolved);
 				if (row.local_path !== canonical) {
 					update.run(canonical, row.file_unique_id);
@@ -244,17 +218,14 @@ export function reconcileMediaCachePaths(
 	return { migrated, invalidated };
 }
 
-function readExisting(
-	path: string,
-	fileOps: MediaCacheFileOps,
-): { bytes: Uint8Array; mimeType: SourceMediaMime; sourceExtension: string } | null {
+function readExisting(path: string): { bytes: Uint8Array; mimeType: SourceMediaMime; sourceExtension: string } | null {
 	const mimeType = sourceMediaMimeForPath(path);
 	const sourceExtension = normalizedSourceExtension(path);
 	if (!mimeType || !sourceExtension) return null;
 	try {
-		const stat = fileOps.stat(path);
+		const stat = statSync(path);
 		if (!stat.isFile() || stat.size <= 0 || stat.size > MEDIA_DOWNLOAD_MAX_BYTES) return null;
-		const bytes = fileOps.read(path);
+		const bytes = new Uint8Array(readFileSync(path));
 		if (bytes.byteLength !== stat.size || bytes.byteLength === 0 || bytes.byteLength > MEDIA_DOWNLOAD_MAX_BYTES)
 			return null;
 		return { bytes, mimeType, sourceExtension };
@@ -269,19 +240,18 @@ export function installMediaCacheFile(
 	fileUniqueId: string,
 	extension: string,
 	bytes: Uint8Array,
-	fileOps: MediaCacheFileOps = defaultFileOps,
 ): string {
-	fileOps.mkdir(cacheDir);
+	mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
 	const basename = createHash("sha256").update(fileUniqueId).digest("hex").slice(0, 32);
 	const target = join(cacheDir, `${basename}.${extension}`);
 	const temporary = `${target}.${process.pid}.${temporarySequence++}.tmp`;
 	try {
-		fileOps.writeExclusive(temporary, bytes);
-		fileOps.rename(temporary, target);
+		writeExclusive(temporary, bytes);
+		renameSync(temporary, target);
 		return target;
 	} catch {
 		try {
-			fileOps.remove(temporary);
+			rmSync(temporary, { force: true });
 		} catch {
 			// A failed cleanup must not expose the original filesystem error or media identity.
 		}
@@ -319,7 +289,7 @@ export function ensureLocalMedia(
 	api: MediaDownloadApi,
 	botId: string,
 	fileUniqueId: string,
-	options: EnsureLocalMediaOptions = {},
+	options: EnsureLocalMediaOptions,
 ): Promise<LocalMediaResult> {
 	return dedupeInFlight(inFlightByDb, db, fileUniqueId, () =>
 		ensureLocalMediaInner(db, api, botId, fileUniqueId, options),
@@ -333,9 +303,7 @@ async function ensureLocalMediaInner(
 	fileUniqueId: string,
 	options: EnsureLocalMediaOptions,
 ): Promise<LocalMediaResult> {
-	const fileOps = options.fileOps ?? defaultFileOps;
-	const cacheDir = options.cacheDir ?? join(process.cwd(), "data", "media");
-	const signal = options.signal;
+	const { cacheDir, signal } = options;
 	if (signal?.aborted) return { ok: false, outcome: "aborted" };
 	const media = db.query("SELECT kind, mime, local_path FROM media WHERE file_unique_id = ?").get(fileUniqueId) as {
 		kind: string;
@@ -349,10 +317,10 @@ async function ensureLocalMediaInner(
 	const video = isVideoMedia(media.kind, media.mime);
 	if (media.local_path) {
 		const existingPath = resolveMediaSourcePath(cacheDir, media.local_path);
-		const existing = existingPath ? readExisting(existingPath, fileOps) : null;
+		const existing = existingPath ? readExisting(existingPath) : null;
 		if (existing) {
 			const existingVideo = video || existing.mimeType.startsWith("video/");
-			const displayReady = !existingVideo && isDisplayReadyPath(existingPath, fileOps);
+			const displayReady = !existingVideo && isDisplayReadyPath(existingPath);
 			return {
 				ok: true,
 				kind,
@@ -403,16 +371,16 @@ async function ensureLocalMediaInner(
 
 	let sourcePath: string | null = null;
 	try {
-		sourcePath = installMediaCacheFile(cacheDir, fileUniqueId, extension, bytes, fileOps);
+		sourcePath = installMediaCacheFile(cacheDir, fileUniqueId, extension, bytes);
 		if (signal?.aborted) {
-			fileOps.remove(sourcePath);
+			rmSync(sourcePath, { force: true });
 			return { ok: false, outcome: "aborted" };
 		}
 		db.query("UPDATE media SET local_path = ? WHERE file_unique_id = ?").run(basename(sourcePath), fileUniqueId);
 	} catch {
 		if (sourcePath) {
 			try {
-				fileOps.remove(sourcePath);
+				rmSync(sourcePath, { force: true });
 			} catch {
 				// The DB remains authoritative; cleanup failure is intentionally non-sensitive.
 			}

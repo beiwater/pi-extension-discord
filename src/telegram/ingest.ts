@@ -4,7 +4,8 @@
 import type { Database } from "bun:sqlite";
 import { log } from "../observability/log.ts";
 import { appendMediaUpdateEvents } from "../db/message-events.ts";
-import { extractUpdateMessage, isTargetChat, normalizeMessage, type CanonicalMessage } from "../telegram/normalize.ts";
+import { extractUpdateMessage, normalizeMessage, type CanonicalMessage } from "../telegram/normalize.ts";
+import { assignStickerShortId } from "../media/sticker-catalog.ts";
 
 export interface IngestResult {
 	kind: "inserted" | "edited" | "enriched" | "duplicate" | "ignored";
@@ -15,25 +16,19 @@ export interface IngestResult {
 }
 
 // first_seen_by for edits that arrive before the original message (started mid-history)
-export const EDIT_UNKNOWN_BOT_ID = "edit-unknown";
+const EDIT_UNKNOWN_BOT_ID = "edit-unknown";
 
+/**
+ * Persist one raw update and its canonical projection. Must run inside the caller's SQLite
+ * transaction (the poller commits it together with the dispatch handoff and the offset).
+ */
 export function ingestUpdate(
 	db: Database,
 	botId: string,
 	update: any,
-	groupPeerId: number,
+	groupChatId: number,
 	/** Vision mode replays persisted descriptions as media_update events; context mode never emits them. */
-	emitMediaUpdates = true,
-): IngestResult {
-	return db.transaction(() => ingestUpdateTransaction(db, botId, update, groupPeerId, emitMediaUpdates))();
-}
-
-function ingestUpdateTransaction(
-	db: Database,
-	botId: string,
-	update: any,
-	groupPeerId: number,
-	emitMediaUpdates = true,
+	emitMediaUpdates: boolean,
 ): IngestResult {
 	const updateId = update.update_id as number;
 
@@ -47,9 +42,9 @@ function ingestUpdateTransaction(
 	const payload = extractUpdateMessage(update);
 	if (!payload) return { kind: "ignored" };
 	const msg = payload.message;
-	if (!isTargetChat(msg.chat.id, groupPeerId)) return { kind: "ignored" };
+	if (msg.chat.id !== groupChatId) return { kind: "ignored" };
 
-	const canonical = normalizeMessage(msg, payload.edited ? (msg.edit_date ?? Math.floor(Date.now() / 1000)) : null);
+	const canonical = normalizeMessage(msg, payload.edited ? msg.edit_date : null);
 	recordMedia(db, botId, canonical); // media identity/file_id tracked even for duplicate messages
 
 	const result = payload.edited
@@ -88,17 +83,7 @@ function recordMedia(db: Database, botId: string, m: CanonicalMessage): void {
 		media.file_id,
 		media.file_unique_id,
 	);
-	if (media.kind === "sticker") {
-		const row = db.query("SELECT rowid FROM media WHERE file_unique_id = ?").get(media.file_unique_id) as {
-			rowid: number;
-		} | null;
-		if (row) {
-			db.query("UPDATE media SET short_id = ? WHERE file_unique_id = ? AND short_id IS NULL").run(
-				`s${row.rowid}`,
-				media.file_unique_id,
-			);
-		}
-	}
+	if (media.kind === "sticker") assignStickerShortId(db, media.file_unique_id);
 }
 
 function insertMessage(db: Database, botId: string, m: CanonicalMessage, emitMediaUpdates = true): IngestResult {

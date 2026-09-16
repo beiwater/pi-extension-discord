@@ -23,6 +23,7 @@
 - `docs/engineering/code-review-2608.md` — 2026-08 全面 review 结论与 Pi 能力审计
 - `docs/engineering/code-review-2608-2.md` — 2026-08-13 四路并行 review:误报记录、修复决策与未采纳清单
 - `docs/engineering/code-review-2608-3.md` — 2026-08-20 六区并行 review:造轮子 / hack / 过度防御 / 冗余清理
+- `docs/engineering/code-review-2609-2.md` — 2026-09-16 生产故障诊断（图片 compaction 切点 / developer role / 失败 turn）与全面整改
 - `docs/runbooks/daemon.md` — daemon 运维
 - `docs/user-guide/` — 双语用户指南
 

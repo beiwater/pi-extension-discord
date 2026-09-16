@@ -319,6 +319,15 @@ describe("unified usage telemetry", () => {
 			};
 			const piStatus = statsText("A", stats, bot, runtime, host);
 			const footerUsage = telegramFooterUsage(null, { A: stats }, { A: runtime }, [bot], host);
+			// The daemon clamps the effective window below the catalog; the footer percent must
+			// follow the runtime snapshot, never the raw catalog value.
+			const catalogHost = {
+				...host,
+				modelRegistry: {
+					getAvailable: () => [{ provider: "test", id: "chat-model", contextWindow: 1_000_000, reasoning: true }],
+				},
+			};
+			expect(telegramFooterUsage(null, { A: stats }, { A: runtime }, [bot], catalogHost)?.contextWindow).toBe(128_000);
 			const footerLines = telegramFooterLines(
 				100,
 				{ fg: (_color, text) => text },

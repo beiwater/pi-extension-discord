@@ -590,7 +590,9 @@ export function telegramFooterUsage(
 	const status = statuses[currentBotId];
 	const bot = configured.get(currentBotId);
 	const model = resolveStatusModel(bot, status, host);
-	const usage = summarizeBotUsage(totals, model?.contextWindow ?? status?.contextWindow ?? 0);
+	// The daemon's window is the clamped effective one (docs/telemetry.md); the catalog value
+	// is only a fallback before the runtime snapshot arrives.
+	const usage = summarizeBotUsage(totals, status?.contextWindow ?? model?.contextWindow ?? 0);
 	return {
 		inputTokens: totals.cacheMiss,
 		outputTokens: totals.outputTokens,

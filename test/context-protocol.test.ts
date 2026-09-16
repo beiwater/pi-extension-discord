@@ -268,6 +268,27 @@ describe("Pi context protocol", () => {
 		expect(anthropic.tokenEstimate.messages).toBeGreaterThanOrEqual(CONTEXT_IMAGE_TOKEN_ESTIMATE);
 	});
 
+	test("a developer-role system prompt is attributed to the system segment", () => {
+		// Regression: Pi's chat-completions adapter sends the system prompt as role "developer"
+		// for reasoning models. Production status then showed system=0 and every prefix token
+		// under "messages", and the system hash never distinguished prompt changes.
+		const payload = (role: string) => ({
+			model: "m",
+			tools: [{ name: "send", parameters: { type: "object" } }],
+			messages: [
+				{ role, content: "protocol ".repeat(200) },
+				{ role: "user", content: "hello" },
+			],
+		});
+		const system = observeProviderPayload(payload("system"), "local-hmac-key");
+		const developer = observeProviderPayload(payload("developer"), "local-hmac-key");
+		// The role literal itself differs by a few bytes; attribution must not.
+		expect(Math.abs(developer.tokenEstimate.system - system.tokenEstimate.system)).toBeLessThan(4);
+		expect(developer.tokenEstimate.messages).toBe(system.tokenEstimate.messages);
+		expect(developer.messageHashes).toHaveLength(1);
+		expect(developer.tokenEstimate.system).toBeGreaterThan(developer.tokenEstimate.messages);
+	});
+
 	test("estimates cache reuse only for an exact observed payload prefix", () => {
 		const first = observeProviderPayload(
 			{

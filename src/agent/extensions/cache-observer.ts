@@ -140,12 +140,14 @@ function payloadSegments(payload: unknown): { system: unknown; tools: unknown; m
 		: Array.isArray(record.input)
 			? record.input
 			: [];
-	const systemMessages = rawMessages.filter(
-		(entry) => entry && typeof entry === "object" && (entry as Record<string, unknown>).role === "system",
-	);
-	const messages = rawMessages.filter(
-		(entry) => !(entry && typeof entry === "object" && (entry as Record<string, unknown>).role === "system"),
-	);
+	// Chat-completions adapters send the system prompt as role "system", or "developer" for
+	// reasoning models; both are the stable prefix, not conversation history.
+	const isSystemMessage = (entry: unknown): boolean => {
+		const role = entry && typeof entry === "object" ? (entry as Record<string, unknown>).role : undefined;
+		return role === "system" || role === "developer";
+	};
+	const systemMessages = rawMessages.filter(isSystemMessage);
+	const messages = rawMessages.filter((entry) => !isSystemMessage(entry));
 	const system = record.system ?? record.instructions ?? systemMessages;
 	const tools = record.tools ?? [];
 	const rest = Object.fromEntries(

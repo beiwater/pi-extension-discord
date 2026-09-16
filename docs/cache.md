@@ -146,7 +146,7 @@ Vision 默认关闭；只有显式 `vision.enabled: true` 才会执行。`auxili
 ## Compaction 与 context epoch
 
 - 主模型传给Pi的有效context window为配置的 `context_window`（缺省 65,536，会钳制 Pi catalog 值）；compaction 触发公式为 `contextTokens > contextWindow - reserveTokens`，其中 `reserveTokens = max(16,384, context_window - compaction_threshold)`，所以 threshold 最高生效值为 `context_window - 16,384`（config 校验拒绝超过它的值，避免 requested/effective 静默分叉）。缺省/示例为 65,536/32,768（提前触发，缓冲 Pi 对 CJK token 与上下文图片的估算偏差）；生产可随窗口上调，如 131,072/114,688。`tg-compaction` 用状态导向 prompt 生成不超过800字的摘要，并保留最近 `compaction_keep_recent` token 原文（注意单位是 token 不是 turn：缺省 1 token 连一条消息都装不下，压缩后实际只剩摘要；生产推荐 20,000，约 1-2 个完整 turn 原文）。更早原文不再进入provider，只有摘要仍可见。
-- 图片预算遍历真实 `custom_message.details` 的图片引用；超预算时本次原生 compact 临时采用 `keepRecentTokens=1`，无论成功失败都恢复配置。文件回收只有下述 media lifecycle 一个入口。
+- 图片预算遍历真实 `custom_message.details` 的图片引用；超预算只多触发一次普通 compaction。cut point 本身由 `tg-compaction` 修正：Pi 的 chars/4 估算对 details 中的图片计 0，handler 按每张 1,100 token 计入 `compaction_keep_recent` 后用 Pi `findCutPoint` 求更晚的合法 cut，因此保留窗口的 provider 成本真正受 `compaction_keep_recent` 约束（CJK 文本仍按 Pi 的 chars/4 估算，实际约 3 倍）。文件回收只有下述 media lifecycle 一个入口。
 - summary 输入包含 `messagesToSummarize` 和 `turnPrefixMessages`，使用 Pi 的 `serializeConversation(convertToLlm(messages))`，因此 Telegram custom message 与 Pi 原生消息遵循同一 provider projection。
 - 摘要只使用配置的 compaction model，遵守统一 retry 次数、单次完整请求 deadline 和 compaction signal；不切换主模型。空摘要、重试耗尽的 provider failure 或 abort 会 cancel；cursor、visible refs 与 epoch 均不伪造变化。
 - 成功结果的 structured details 保存当前 `consumedSeq` 与 retained `visibleMessageIds`。runtime 用这些 details 替换 visibility、推进 epoch；`consumedSeq` 永不回退。

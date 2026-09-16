@@ -63,7 +63,7 @@
 - local assistant text（未调send）→ agent_events + TUI；session里只保留固定`[no_send]`，不把未发布prose带入后续provider context。
 
 - provider watchdog 只负责单次请求从创建 stream 到消费结束的 deadline 与取消；聊天使用 Pi session retry，摘要使用 Pi `retryAssistantCall`，共用 `provider_retries`，adapter retry 设为 0。摘要只请求配置的 compaction model，传递 compaction signal，停止时 abortCompaction，不另切主模型。摘要覆盖 Pi 丢弃的完整消息及 split-turn 前缀。
-- 图片预算读取真实 `SessionEntry.custom_message.details`。图片超预算时仅对本次原生 compact 临时使用 `keepRecentTokens=1`，成功或失败都恢复设置；runtime 不删除图片，统一由 media lifecycle 按跨 bot 引用回收。
+- 上下文图片只存在 `custom_message.details`，Pi 的 chars/4 cut point 对它们计 0；`tg-compaction` 在 `session_before_compact` 里按每张 `CONTEXT_IMAGE_TOKEN_ESTIMATE` 把图片计入 `compaction_keep_recent`，用 Pi 公开的 `findCutPoint` 求同一文本估算下更晚的合法 cut，被多丢弃的 entry 一并进入摘要输入；cut 永不早于 Pi 自己的结果。图片字节预算读取真实 `SessionEntry.custom_message.details`，超预算只是多触发一次普通 compaction，不再改写 `keepRecentTokens`；上一轮 provider turn 以 error/aborted 结束时跳过 auto-compaction，等下一个健康 turn。runtime 不删除图片，统一由 media lifecycle 按跨 bot 引用回收。
 
 ## run_js sandbox 威胁模型
 

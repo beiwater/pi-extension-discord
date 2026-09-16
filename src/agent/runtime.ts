@@ -74,6 +74,7 @@ import { availableSuffixBudget, estimateProviderTokensUpperBound, packMessageEve
 import {
 	estimateCacheReadFromPrefix,
 	buildTelegramContextBlocks,
+	imageAwareCompactionCut,
 	makeAssistantPersistencePolicyExtension,
 	makeCachePayloadObserverExtension,
 	makeTelegramCompactionExtension,
@@ -168,6 +169,8 @@ export class BotRuntime {
 	private cooldownUntil = 0;
 	private cooldownAfterFlush = false;
 	private controlCompacting = false;
+	/** Last assistant message ended in error/abort; auto-compaction waits for a healthy turn. */
+	private lastTurnFailed = false;
 	private lastControlCompact: RuntimeControlSnapshot["lastCompact"] = null;
 	private readonly monotonicNow: () => number;
 	private visibleMessageIds = new Set<number>();
@@ -547,6 +550,7 @@ export class BotRuntime {
 				case "message_end": {
 					const msg = event.message;
 					if (msg.role === "assistant") {
+						this.lastTurnFailed = msg.stopReason === "error" || msg.stopReason === "aborted";
 						this.observeThinking(msg, now, true);
 						const thinking = msg.content
 							.filter((c) => c.type === "thinking")
@@ -753,7 +757,11 @@ export class BotRuntime {
 		event: SessionBeforeCompactEvent,
 	): Promise<{ cancel: true } | { compaction: CompactionResult }> {
 		try {
-			const prep = event.preparation;
+			const branchEntries = event.branchEntries;
+			const prep = {
+				...event.preparation,
+				...imageAwareCompactionCut(branchEntries, event.preparation, event.preparation.settings.keepRecentTokens),
+			};
 			const gen = await this.generateCompactionSummary(prep, event.signal);
 			if (!("summary" in gen)) {
 				// NOTE: the SDK swallows extension handler exceptions and would silently fall back
@@ -761,7 +769,6 @@ export class BotRuntime {
 				this.recordEvent("error", { stage: "compaction", error: gen.failure });
 				return { cancel: true };
 			}
-			const branchEntries = event.branchEntries;
 			const keptIndex = branchEntries.findIndex((entry) => entry.id === prep.firstKeptEntryId);
 			const keptEntries = keptIndex >= 0 ? branchEntries.slice(keptIndex) : [];
 			const chatId = Number(`-100${this.config.groupPeerId}`);
@@ -1217,11 +1224,14 @@ export class BotRuntime {
 	private async maybeAutoCompact(): Promise<void> {
 		if (this.stopping || !this.session) return;
 		// The provider turn has settled, but flush still owns its state until this returns.
-		if (this.controlCompacting || this.session.isStreaming) {
+		// A turn that just failed at the provider makes the summary request just as likely to
+		// fail (and to burn its retry budget), so wait for the next successful turn.
+		if (this.controlCompacting || this.session.isStreaming || this.lastTurnFailed) {
 			log.warn("agent_runtime", "auto_compact_skipped", {
 				bot_id: this.bot.id,
 				control_compacting: this.controlCompacting,
 				is_streaming: this.session.isStreaming,
+				last_turn_failed: this.lastTurnFailed,
 			});
 			return;
 		}
@@ -1238,17 +1248,9 @@ export class BotRuntime {
 				threshold: this.bot.compactionThreshold,
 				image_budget: this.bot.contextImageBudgetBytes,
 			});
-			const settings = this.session.settingsManager;
-			const keepRecentTokens = settings.getCompactionKeepRecentTokens();
-			const imagePressure = imageBytes > this.bot.contextImageBudgetBytes;
-			// Use Pi's cut-point algorithm to summarize the image-bearing history instead of
-			// deleting shared files behind retained entries. Restore normal retention afterwards.
-			if (imagePressure) settings.applyOverrides({ compaction: { keepRecentTokens: 1 } });
-			try {
-				await this.session.compact();
-			} finally {
-				if (imagePressure) settings.applyOverrides({ compaction: { keepRecentTokens } });
-			}
+			// The before-compact handler charges retained images against keepRecentTokens, so a
+			// normal compaction already sheds the image-bearing history.
+			await this.session.compact();
 		} catch (error) {
 			// Estimation or compaction failure must never break the settled flush.
 			log.warn("agent_runtime", "auto_compact_failed", {

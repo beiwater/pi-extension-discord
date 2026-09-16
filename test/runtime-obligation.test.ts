@@ -302,7 +302,7 @@ test("compaction propagates cancellation and summarizes the discarded split-turn
 	expect(requestText).toContain("latest-discarded-message");
 });
 
-test("image pressure uses Pi retention and never deletes a retained shared image", async () => {
+test("image pressure runs a normal Pi compaction and never deletes a retained shared image", async () => {
 	const { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } = await import("node:fs");
 	const { tmpdir } = await import("node:os");
 	const { join } = await import("node:path");
@@ -328,13 +328,17 @@ test("image pressure uses Pi retention and never deletes a retained shared image
 		let attempts = 0;
 		session.compact = async () => {
 			attempts++;
-			expect(session.settingsManager.getCompactionKeepRecentTokens()).toBe(1);
+			// The before-compact cut charges images; retention itself is never overridden.
+			expect(session.settingsManager.getCompactionKeepRecentTokens()).toBe(20000);
 			if (attempts === 2) throw new Error("summary unavailable");
 		};
 		await (rt as any).maybeAutoCompact();
 		await (rt as any).maybeAutoCompact();
 		expect(attempts).toBe(2);
-		expect(session.settingsManager.getCompactionKeepRecentTokens()).toBe(20000);
+		// A turn that just failed at the provider must not immediately spend a summary request.
+		(rt as any).lastTurnFailed = true;
+		await (rt as any).maybeAutoCompact();
+		expect(attempts).toBe(2);
 		expect(existsSync(join(mediaDir, "shared.jpg"))).toBe(true);
 	} finally {
 		rmSync(root, { recursive: true, force: true });

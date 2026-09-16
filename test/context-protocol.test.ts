@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { findCutPoint, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import {
 	buildContextFingerprint,
@@ -22,6 +22,7 @@ import {
 	applyAssistantPersistencePolicy,
 	contextImageBytes,
 	estimateCacheReadFromPrefix,
+	imageAwareCompactionCut,
 	observeProviderPayload,
 	projectTelegramContext,
 } from "../src/agent/extensions/index.ts";
@@ -287,6 +288,76 @@ describe("Pi context protocol", () => {
 		expect(developer.tokenEstimate.messages).toBe(system.tokenEstimate.messages);
 		expect(developer.messageHashes).toHaveLength(1);
 		expect(developer.tokenEstimate.system).toBeGreaterThan(developer.tokenEstimate.messages);
+	});
+
+	test("compaction cut charges context images so keepRecentTokens bounds the retained window", () => {
+		// Regression: images live in custom-message details and are only materialized at
+		// projection, so Pi's chars/4 cut point counted them as zero and retained an unbounded
+		// image tail; production compacted after nearly every turn without shrinking.
+		const manager = SessionManager.inMemory("/tmp/unused");
+		const contextEntry = (text: string, images: number) =>
+			manager.appendCustomMessageEntry("telegram_context_v2", text, false, {
+				version: 4,
+				consumedSeq: 1,
+				providerText: text,
+				blocks: [
+					{ type: "text", text },
+					...Array.from({ length: images }, (_, index) => ({
+						type: "image",
+						name: `img-${index}.jpg`,
+						mime: "image/jpeg",
+					})),
+				],
+				stickerCandidates: "",
+				visibleMessageIds: [1],
+				events: [],
+			});
+		const reply = () =>
+			manager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "ok" }],
+				api: "openai-completions",
+				provider: "test",
+				model: "test",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { total: 0 } },
+				stopReason: "stop",
+				timestamp: 1,
+			} as never);
+		contextEntry("old text ".repeat(50), 0);
+		reply();
+		const firstImageBatch = contextEntry("photo album", 8);
+		reply();
+		contextEntry("more photos", 8);
+		reply();
+		const latest = contextEntry("latest", 0);
+		reply();
+		const entries = manager.getBranch();
+		// Pi's own cut keeps the whole tail: text alone is far below 20k estimated tokens.
+		const piCut = findCutPoint(entries, 0, entries.length, 20_000);
+		expect(entries[piCut.firstKeptEntryIndex]!.id).toBe(entries[0]!.id);
+		const piPrep = {
+			firstKeptEntryId: entries[0]!.id,
+			messagesToSummarize: [],
+			turnPrefixMessages: [],
+			isSplitTurn: false,
+		};
+		const noImages = imageAwareCompactionCut(entries, piPrep, 20_000);
+		// 16 images ≈ 17.6k charged tokens plus text: still under 20k, so Pi's cut stands.
+		expect(noImages).toBe(piPrep);
+		const cut = imageAwareCompactionCut(entries, piPrep, 6_000);
+		// ~5 images fit; the cut moves past the first album and the discarded turns are summarized.
+		const keptIndex = entries.findIndex((entry) => entry.id === cut.firstKeptEntryId);
+		expect(keptIndex).toBeGreaterThan(entries.findIndex((entry) => entry.id === firstImageBatch));
+		expect(keptIndex).toBeLessThanOrEqual(entries.findIndex((entry) => entry.id === latest));
+		const summarized = cut.messagesToSummarize.concat(cut.turnPrefixMessages);
+		expect(summarized.length).toBeGreaterThanOrEqual(3);
+		expect(JSON.stringify(summarized)).toContain("old text");
+		expect(JSON.stringify(summarized)).toContain("photo album");
+		// Never earlier than Pi's cut, and the summary covers every discarded entry once.
+		expect(keptIndex).toBeGreaterThanOrEqual(piCut.firstKeptEntryIndex);
+		expect(summarized.length).toBe(
+			entries.slice(0, keptIndex).filter((entry) => entry.type === "message" || entry.type === "custom_message").length,
+		);
 	});
 
 	test("estimates cache reuse only for an exact observed payload prefix", () => {

@@ -72,6 +72,7 @@ import {
 } from "../db/message-events.ts";
 import {
 	availableSuffixBudget,
+	CONTEXT_IMAGE_TOKEN_ESTIMATE,
 	DEFAULT_REASONING_RESERVE,
 	DEFAULT_TOOL_FOLLOWUP_RESERVE,
 	estimateProviderTokensUpperBound,
@@ -80,12 +81,13 @@ import {
 import {
 	estimateCacheReadFromPrefix,
 	buildTelegramContextBlocks,
-	imageAwareCompactionCut,
+	compactionTextBudget,
+	buildCompactionContent,
+	isTelegramContextDetails,
 	makeAssistantPersistencePolicyExtension,
 	makeCachePayloadObserverExtension,
 	makeTelegramCompactionExtension,
 	makeTelegramContextExtension,
-	serializeCompactionMessages,
 	TELEGRAM_CONTEXT_TYPE,
 	TELEGRAM_CONTEXT_VERSION,
 	TELEGRAM_EXTENSION_ORDER,
@@ -607,7 +609,14 @@ export class BotRuntime {
 						trigger_message_id: this.currentTriggerMessageId,
 					});
 					break;
+				case "agent_end":
+					// All messages are persisted now; Pi's native compaction preparation runs next.
+					this.refreshCompactionBudget();
+					break;
 				case "agent_settled":
+					this.session?.settingsManager.applyOverrides({
+						compaction: { keepRecentTokens: this.bot.compactionKeepRecent },
+					});
 					this.running = false;
 					this.typingLease.stop();
 					this.finishAssistantActivity(now);
@@ -765,10 +774,7 @@ export class BotRuntime {
 	): Promise<{ cancel: true } | { compaction: CompactionResult }> {
 		try {
 			const branchEntries = event.branchEntries;
-			const prep = {
-				...event.preparation,
-				...imageAwareCompactionCut(branchEntries, event.preparation, event.preparation.settings.keepRecentTokens),
-			};
+			const prep = event.preparation;
 			const gen = await this.generateCompactionSummary(prep, event.signal);
 			if (!("summary" in gen)) {
 				// NOTE: the SDK swallows extension handler exceptions and would silently fall back
@@ -810,24 +816,58 @@ export class BotRuntime {
 	): Promise<
 		{ summary: string; usage: Awaited<ReturnType<ModelRuntime["completeSimple"]>>["usage"] } | { failure: string }
 	> {
-		const conversation = serializeCompactionMessages([...prep.messagesToSummarize, ...prep.turnPrefixMessages]);
-		const userText =
-			`<conversation>\n${conversation}\n</conversation>\n\n` +
-			(prep.previousSummary
-				? `<previous-summary>\n${prep.previousSummary}\n</previous-summary>\n\n把上面的旧摘要与新内容合并成一份更新的摘要。`
-				: "请输出摘要。");
+		const model = this.compactionModel;
+		const messages = [...prep.messagesToSummarize, ...prep.turnPrefixMessages];
+		const imageReferences = messages.reduce(
+			(count, message) =>
+				count +
+				(message.role === "custom" && isTelegramContextDetails(message.details)
+					? message.details.blocks.filter((block) => block.type === "image").length
+					: 0),
+			0,
+		);
+		const content = buildCompactionContent(
+			messages,
+			prep.previousSummary,
+			model.input.includes("image") ? createContextImageResolver(join(this.config.dataDir, "media")) : undefined,
+		);
+		const imagesAttached = typeof content === "string" ? 0 : content.filter((block) => block.type === "image").length;
+		const text =
+			typeof content === "string"
+				? content
+				: content
+						.filter((block) => block.type === "text")
+						.map((block) => block.text)
+						.join("");
+		const inputTokens =
+			estimateProviderTokensUpperBound(COMPACTION_SUMMARY_PROMPT + text) +
+			imagesAttached * CONTEXT_IMAGE_TOKEN_ESTIMATE;
+		const maxTokens = Math.min(4096, model.maxTokens);
+		log.info("agent_runtime", "compaction_input", {
+			bot_id: this.bot.id,
+			vision_supported: model.input.includes("image"),
+			images_attached: imagesAttached,
+			images_unavailable: imageReferences - imagesAttached,
+			input_tokens_estimated: inputTokens,
+		});
+		if (inputTokens + maxTokens + 2048 > model.contextWindow) {
+			log.warn("agent_runtime", "compaction_input_rejected", {
+				bot_id: this.bot.id,
+				category: "model_window_exceeded",
+			});
+			return { failure: "summary input exceeds model window" };
+		}
 		const request = {
 			systemPrompt: COMPACTION_SUMMARY_PROMPT,
-			messages: [{ role: "user" as const, content: userText, timestamp: Date.now() }],
+			messages: [{ role: "user" as const, content, timestamp: Date.now() }],
 		};
-		const model = this.compactionModel;
 		const result = await retryAssistantCall(
 			async () => {
 				const response = await guardProviderCall(
 					(attemptSignal) =>
 						this.modelRuntime.streamSimple(model, request, {
 							cacheRetention: "none",
-							maxTokens: Math.min(4096, model.maxTokens),
+							maxTokens,
 							reasoning: this.compactionReasoning,
 							signal: attemptSignal,
 							timeoutMs: this.bot.providerTimeoutMs,
@@ -1254,15 +1294,33 @@ export class BotRuntime {
 				image_bytes: imageBytes,
 				image_budget: this.bot.contextImageBudgetBytes,
 			});
-			// The before-compact handler charges retained images against keepRecentTokens, so a
-			// normal compaction already sheds the image-bearing history.
-			await this.session.compact();
+			await this.compactSession();
 		} catch (error) {
 			// Estimation or compaction failure must never break the settled flush.
 			log.warn("agent_runtime", "auto_compact_failed", {
 				bot_id: this.bot.id,
 				category: errorCategory(error),
 			});
+		}
+	}
+
+	private refreshCompactionBudget(): void {
+		if (!this.session) return;
+		const keepRecentTokens = compactionTextBudget(
+			this.session.sessionManager.getBranch(),
+			this.bot.compactionKeepRecent,
+		);
+		this.session.settingsManager.applyOverrides({ compaction: { keepRecentTokens } });
+	}
+
+	/** Manual/image-pressure paths need the same pre-preparation accounting as native auto-compaction. */
+	private async compactSession(): Promise<CompactionResult> {
+		const session = this.session!;
+		this.refreshCompactionBudget();
+		try {
+			return await session.compact();
+		} finally {
+			session.settingsManager.applyOverrides({ compaction: { keepRecentTokens: this.bot.compactionKeepRecent } });
 		}
 	}
 
@@ -1281,7 +1339,7 @@ export class BotRuntime {
 		}
 		this.controlCompacting = true;
 		try {
-			const result = await this.session.compact();
+			const result = await this.compactSession();
 			this.lastControlCompact = { at: Date.now(), outcome: "ok" };
 			return { ok: true, epoch: this.epoch, tokensBefore: result.tokensBefore };
 		} catch {

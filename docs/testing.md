@@ -26,7 +26,7 @@
 - `visibility.test.ts` — active context 的完整消息可见性与 compaction 边界。
 - `telegram-delivery.test.ts` — 全局 mention 优先级与 caption、乱序 edit、manual send unknown outcome、control retention 与 pending handoff 跨重启交付。
 - `daemon-control.test.ts` — 临时假 daemon 的精确进程归属与含空格路径，拒绝其他部署与测试进程。
-- `runtime-obligation.test.ts` — 真实 Pi SessionManager 下的发送后遥测失败、turn 内/后压缩可见性、split-turn 摘要取消、图片压力设置恢复与共享文件保留； direct address（explicit @mention / reply / 配置名称点名）在 coalesced trigger 下仍建 durable obligation 并交付、已可见不重复建、普通 overflow 静默消费设计锁定，以及 flushLoop teardown 窗口 trigger 不滞留。
+- `runtime-obligation.test.ts` — 真实 Pi AgentSession 的图片多/文字少时自动、手动、取消压缩及设置恢复；视觉/纯文本摘要模型输入与图片顺序、窗口超限的零调用拒绝和日志脱敏；发送后遥测失败、turn 内/后可见性、split-turn 取消与共享图片保留，以及 coalesced obligation、普通 overflow 设计锁定与 flushLoop teardown 不滞留。
 
 ## 测试选择规则
 

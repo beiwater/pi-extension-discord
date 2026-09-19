@@ -14,7 +14,9 @@
 
 ## CACHE_SCHEMA_VERSION
 
-当前：**18**。
+当前：**19**。
+
+v19：支持 image 输入的 compaction model 接收待丢弃消息中按原位置交错的图片；不支持时仍只传文字，缺失文件与未传图片以脱敏计数记录。摘要请求超出模型窗口的保守估算时，在 provider 调用前拒绝，不写入残缺摘要。图片计量移到 Pi preparation 之前，Pi 继续拥有合法切点、split-turn 与原生阈值触发。新增摘要 envelope golden，主聊天 system/tools/消息序列化 hash 不变。各次升级均按既有 fingerprint 规则创建新 session/epoch，保留旧 session，不改写旧 prefix；首次请求冷缓存。
 
 v18 修复压缩输入遗漏：摘要同时接收 Pi 的 `messagesToSummarize` 与被丢弃的 `turnPrefixMessages`，不再遗漏拆分 turn 的前半段。图片压力改由原生 compaction 临时缩小保留窗口，不删除共享文件来改变 provider 内容。system/tools/序列化 grammar 的 golden hash 不变；由于摘要输入语义改变，保守开启新 epoch，旧 session 文件保留，首次请求会有一次冷缓存。
 
@@ -146,9 +148,10 @@ Vision 默认关闭；只有显式 `vision.enabled: true` 才会执行。`auxili
 ## Compaction 与 context epoch
 
 - 主模型传给Pi的有效context window为配置的 `context_window`（缺省 65,536，会钳制 Pi catalog 值）；compaction 触发公式为 `contextTokens > contextWindow - reserveTokens`，其中 `reserveTokens = max(16,384, context_window - compaction_threshold)`，所以 threshold 最高生效值为 `context_window - 16,384`（config 校验拒绝超过它的值，避免 requested/effective 静默分叉）。缺省/示例为 65,536/32,768（提前触发，缓冲 Pi 对 CJK token 与上下文图片的估算偏差）；生产可随窗口上调，如 131,072/114,688。`tg-compaction` 用状态导向 prompt 生成不超过800字的摘要，并保留最近 `compaction_keep_recent` token 原文（注意单位是 token 不是 turn：缺省 1 token 连一条消息都装不下，压缩后实际只剩摘要；生产推荐 20,000，约 1-2 个完整 turn 原文）。更早原文不再进入provider，只有摘要仍可见。
-- 图片预算遍历真实 `custom_message.details` 的图片引用；超预算只多触发一次普通 compaction。cut point 本身由 `tg-compaction` 修正：Pi 的 chars/4 估算对 details 中的图片计 0，handler 按每张 1,100 token 计入 `compaction_keep_recent` 后用 Pi `findCutPoint` 求更晚的合法 cut，因此保留窗口的 provider 成本真正受 `compaction_keep_recent` 约束（CJK 文本仍按 Pi 的 chars/4 估算，实际约 3 倍）。文件回收只有下述 media lifecycle 一个入口。
+- 图片预算遍历真实 `custom_message.details` 的图片引用；超预算只多触发一次普通 compaction。Pi preparation 前按每张 1,100 token 把 `compaction_keep_recent` 换算成临时文本预算：自动路径在 `agent_end`（持久化结束、原生 preparation 之前）更新，手动/图片压力路径在 `compact()` 前更新。Pi 自己选择合法切点与 split-turn；settled 或手动路径 finally 恢复配置值。不能只在 `session_before_compact` 修切点，因为全文文字小于预算时 Pi 会提前返回，根本不触发该事件。预算是估算，切点可保留跨过阈值的完整 entry，CJK 仍沿用 Pi chars/4；不承诺精确 token 上限。文件回收只有下述 media lifecycle 一个入口。
 - summary 输入包含 `messagesToSummarize` 和 `turnPrefixMessages`，使用 Pi 的 `serializeConversation(convertToLlm(messages))`，因此 Telegram custom message 与 Pi 原生消息遵循同一 provider projection。
 - 摘要只使用配置的 compaction model，遵守统一 retry 次数、单次完整请求 deadline 和 compaction signal；不切换主模型。空摘要、重试耗尽的 provider failure 或 abort 会 cancel；cursor、visible refs 与 epoch 均不伪造变化。
+- 摘要模型 catalog `input` 包含 `image` 时，复用 context 图片 resolver，在对应消息位置传入图片，覆盖完整丢弃段与 split-turn 前缀；动态 sticker 候选永不进入摘要，base64 不持久化。不支持图片或文件缺失时保留已有文字，不额外逐图调用视觉模型。输入采用 UTF-8 bytes/2 + 1,100/图的保守估算，预留输出与 2,048 安全余量；超窗口拒绝调用，应改用足够窗口的摘要模型。正常聊天无额外调用，压缩时增加实际图片输入成本。
 - 成功结果的 structured details 保存当前 `consumedSeq` 与 retained `visibleMessageIds`。runtime 用这些 details 替换 visibility、推进 epoch；`consumedSeq` 永不回退。
 - visibility与epoch提交后，provider外observer按所有当前配置bot的visible refs、未消费event与reply obligation，对本地媒体cache做最多256项回收。它清可再生文件、`local_path`与 `context_files` 派生图片，失败不改变compaction结果；startup backfill复用同一引用边界，避免重新下载已回收历史。
 - 媒体回收不修改session、summary、message/event serialization或provider payload，因此不改变cache schema，也不增加LLM call/token；派生图片可按 `context_files` 记录随时重建。
@@ -170,13 +173,14 @@ Vision 默认关闭；只有显式 `vision.enabled: true` 才会执行。`auxili
 
 | 项目 | 值 |
 | --- | --- |
-| schema | `17` |
+| schema | `19` |
 | zh system | `b2f0432b9b7b` |
 | en system | `231c26fbb95b` |
 | legacy message serializer | `68a17d6e5c05` |
 | immutable event serializer | `4a57de738bf9` |
 | tools | `c28a3db01190` |
 | compaction prompt | `045a5241fdd7` |
+| multimodal compaction envelope | `e2da2b8b68fa` |
 | extension order | `e04f7032d531` |
 | context protocol | `2e1c7762b239` |
 | sticker catalog block | exact-string lock（`s<id>: <emoji> <描述>` 行，set/format 不渲染） |

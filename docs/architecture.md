@@ -63,7 +63,7 @@
 - local assistant text（未调send）→ agent_events + TUI；session里只保留固定`[no_send]`，不把未发布prose带入后续provider context。
 
 - provider watchdog 只负责单次请求从创建 stream 到消费结束的 deadline 与取消；聊天使用 Pi session retry，摘要使用 Pi `retryAssistantCall`，共用 `provider_retries`，adapter retry 设为 0。摘要只请求配置的 compaction model，传递 compaction signal，停止时 abortCompaction，不另切主模型。摘要覆盖 Pi 丢弃的完整消息及 split-turn 前缀。
-- 上下文图片只存在 `custom_message.details`，Pi 的 chars/4 cut point 对它们计 0；`tg-compaction` 在 `session_before_compact` 里按每张 `CONTEXT_IMAGE_TOKEN_ESTIMATE` 把图片计入 `compaction_keep_recent`，用 Pi 公开的 `findCutPoint` 求同一文本估算下更晚的合法 cut，被多丢弃的 entry 一并进入摘要输入；cut 永不早于 Pi 自己的结果。token 阈值 compaction 完全由 Pi 在 turn 内执行，runtime 的 post-turn hook 只看 Pi 看不到的图片字节预算（读取真实 `SessionEntry.custom_message.details`），超预算只是多触发一次普通 compaction，不改写 `keepRecentTokens`；上一轮 provider turn 以 error/aborted 结束时跳过 auto-compaction，等下一个健康 turn。runtime 不删除图片，统一由 media lifecycle 按跨 bot 引用回收。
+- 上下文图片只存在 `custom_message.details`，Pi 的 chars/4 cut point 对它们计 0。runtime 在 Pi preparation **之前**把图片成本换算成临时文本保留预算：原生自动路径用 `agent_end`，手动/图片压力路径在 `compact()` 前更新；settled/finally 恢复配置值。合法切点、split-turn、阈值/overflow 与 retry 仍由 Pi 原生拥有，不在扩展中重建 preparation。post-turn hook 只看额外的图片字节压力，provider 失败时跳过该 hook。摘要模型支持 image 时，按原消息位置投影待丢弃图片，且排除动态 sticker 候选；输入超摘要模型窗口时拒绝调用，保留原状态。runtime 不删除图片，统一由 media lifecycle 按跨 bot 引用回收。估算、退化与成本边界见 [Cache 工程](cache.md)。
 
 ## run_js sandbox 威胁模型
 

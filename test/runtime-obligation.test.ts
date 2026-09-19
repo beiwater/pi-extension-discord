@@ -7,10 +7,20 @@
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { BotRuntime } from "../src/agent/runtime.ts";
 import type { AppConfig, BotConfig } from "../src/config.ts";
-import { SessionManager, SettingsManager, type ModelRuntime } from "@earendil-works/pi-coding-agent";
+import {
+	createAgentSession,
+	DefaultResourceLoader,
+	SessionManager,
+	SettingsManager,
+	type ModelRuntime,
+} from "@earendil-works/pi-coding-agent";
+import { makeTelegramCompactionExtension } from "../src/agent/extensions/index.ts";
+import { setLogSink } from "../src/observability/log.ts";
 
 const CHAT_ID = -1004402809405;
 const BOT_ID = "A";
@@ -368,6 +378,7 @@ test("image pressure runs a normal Pi compaction and never deletes a retained sh
 		writeFileSync(join(mediaDir, "shared.jpg"), new Uint8Array(100));
 		(rt as any).config.dataDir = root;
 		(rt as any).bot.contextImageBudgetBytes = 10;
+		(rt as any).bot.compactionKeepRecent = 20000;
 		const session = (rt as any).session;
 		session.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 20000 } });
 		session.sessionManager.appendCustomMessageEntry("telegram_context_v2", "image", false, {
@@ -382,7 +393,7 @@ test("image pressure runs a normal Pi compaction and never deletes a retained sh
 		let attempts = 0;
 		session.compact = async () => {
 			attempts++;
-			// The before-compact cut charges images; retention itself is never overridden.
+			// One small image fits the configured retention window.
 			expect(session.settingsManager.getCompactionKeepRecentTokens()).toBe(20000);
 			if (attempts === 2) throw new Error("summary unavailable");
 		};
@@ -408,4 +419,207 @@ test("compaction telemetry failure cancels explicitly instead of enabling Pi's d
 	expect(await (rt as any).handleBeforeCompact({ preparation: {}, signal: new AbortController().signal })).toEqual({
 		cancel: true,
 	});
+});
+
+function assistantResult(input = 100) {
+	return {
+		role: "assistant" as const,
+		content: [{ type: "text" as const, text: "summary" }],
+		api: "openai-responses" as const,
+		provider: "test",
+		model: "test-model",
+		usage: {
+			input,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: input + 1,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop" as const,
+		timestamp: Date.now(),
+	};
+}
+
+function imageDetails(id: number) {
+	return {
+		version: 4,
+		consumedSeq: id,
+		providerText: `photo #${id}`,
+		blocks: [
+			{ type: "text", text: `photo #${id}` },
+			...Array.from({ length: 4 }, () => ({ type: "image", name: "photo.png", mime: "image/png" })),
+		],
+		stickerCandidates: "stale-candidate-canary",
+		visibleMessageIds: [id],
+		events: [],
+	};
+}
+
+for (const mode of ["manual", "automatic", "cancelled"] as const) {
+	test(`real Pi ${mode} compaction reaches the extension when text fits but images exceed retention`, async () => {
+		const root = mkdtempSync(join(tmpdir(), "tg-native-compaction-"));
+		const { rt, db } = setup();
+		const loader = new DefaultResourceLoader({
+			cwd: root,
+			agentDir: root,
+			noExtensions: true,
+			noSkills: true,
+			noPromptTemplates: true,
+			noContextFiles: true,
+			systemPrompt: "Deterministic fixture.",
+			extensionFactories: [makeTelegramCompactionExtension((event) => (rt as any).handleBeforeCompact(event))],
+		});
+		await loader.reload();
+		const modelRuntime = {
+			getModel: () => fakeModel(),
+			hasConfiguredAuth: () => true,
+			getAuth: async () => ({ auth: { apiKey: "fixture" } }),
+		} as unknown as ModelRuntime;
+		const manager = SessionManager.inMemory(root);
+		for (let i = 1; i <= 12; i++) {
+			manager.appendCustomMessageEntry("telegram_context_v2", `photo #${i}`, false, imageDetails(i));
+			manager.appendMessage(assistantResult());
+		}
+		const { session } = await createAgentSession({
+			cwd: root,
+			model: fakeModel() as never,
+			modelRuntime,
+			sessionManager: manager,
+			resourceLoader: loader,
+			settingsManager: SettingsManager.inMemory({
+				compaction: { enabled: true, reserveTokens: 32768, keepRecentTokens: 20000 },
+			}),
+			noTools: "all",
+		});
+		(rt as any).session = session;
+		(rt as any).bot.compactionKeepRecent = 20000;
+		(rt as any).subscribeEvents();
+		let summaryMessages: unknown[] = [];
+		(rt as any).generateCompactionSummary = async (prep: any) => {
+			summaryMessages = [...prep.messagesToSummarize, ...prep.turnPrefixMessages];
+			if (mode === "cancelled") return { failure: "summary generation aborted" };
+			return { summary: "summary", usage: assistantResult().usage };
+		};
+		session.agent.streamFunction = () => {
+			const stream = createAssistantMessageEventStream();
+			stream.push({ type: "done", reason: "stop", message: assistantResult(50000) });
+			return stream;
+		};
+		try {
+			if (mode === "automatic") await session.prompt("continue");
+			else expect((await rt.compactForControl()).ok).toBe(mode === "manual");
+			expect(summaryMessages.length).toBeGreaterThan(0);
+			expect(manager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(
+				mode === "cancelled" ? 0 : 1,
+			);
+			const retained = manager.buildContextEntries().filter((entry) => entry.type === "custom_message").length;
+			if (mode === "cancelled") expect(retained).toBe(12);
+			else expect(retained).toBeLessThan(12);
+			expect(session.settingsManager.getCompactionKeepRecentTokens()).toBe(20000);
+		} finally {
+			session.dispose();
+			db.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const supportsImages of [true, false]) {
+	test(`summary model image capability (${supportsImages}) controls multimodal input without persisting image bytes`, async () => {
+		const root = mkdtempSync(join(tmpdir(), "tg-summary-images-"));
+		const { rt, db } = setup();
+		mkdirSync(join(root, "media"));
+		writeFileSync(join(root, "media", "photo.png"), "fixture-image-bytes");
+		(rt as any).config.dataDir = root;
+		(rt as any).compactionModel = { ...fakeModel(), input: supportsImages ? ["text", "image"] : ["text"] };
+		let request: any;
+		(rt as any).modelRuntime = {
+			streamSimple: (_model: unknown, input: unknown) => {
+				request = input;
+				const stream = createAssistantMessageEventStream();
+				stream.push({ type: "done", reason: "stop", message: assistantResult() });
+				return stream;
+			},
+		};
+		const messages = [1, 2].map((id) => ({
+			role: "custom",
+			customType: "telegram_context_v2",
+			content: `photo #${id}`,
+			display: false,
+			timestamp: id,
+			details: imageDetails(id),
+		}));
+		const original = JSON.stringify(messages);
+		const logs: string[] = [];
+		const restoreLogs = setLogSink((line) => logs.push(line));
+		try {
+			const result = await (rt as any).generateCompactionSummary(
+				{
+					messagesToSummarize: [messages[0]],
+					turnPrefixMessages: [messages[1]],
+					previousSummary: "old summary",
+				},
+				new AbortController().signal,
+			);
+			expect(result.summary).toBe("summary");
+			const content = request.messages[0].content;
+			const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content;
+			expect(blocks.filter((b: any) => b.type === "image")).toHaveLength(supportsImages ? 8 : 0);
+			if (supportsImages) {
+				expect(blocks[0].text).toContain("photo #1");
+				expect(blocks[5].text).toContain("photo #2");
+			}
+			const text = blocks
+				.filter((b: any) => b.type === "text")
+				.map((b: any) => b.text)
+				.join("");
+			expect(text).toContain("photo #1");
+			expect(text).toContain("photo #2");
+			expect(text).toContain("old summary");
+			expect(text).not.toContain("stale-candidate-canary");
+			expect(JSON.stringify(messages)).toBe(original);
+			expect(
+				logs.map((line) => JSON.parse(line)).find((line) => line.event === "compaction_input")?.fields,
+			).toMatchObject({ vision_supported: supportsImages, images_attached: supportsImages ? 8 : 0 });
+			expect(logs.join("")).not.toContain("fixture-image-bytes");
+			expect(logs.join("")).not.toContain("photo #");
+		} finally {
+			restoreLogs();
+			db.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+}
+
+test("an oversized summary input is refused before any paid request and records a bounded diagnostic", async () => {
+	const { rt, db } = setup();
+	(rt as any).compactionModel = { ...fakeModel(), contextWindow: 8192 };
+	let calls = 0;
+	(rt as any).modelRuntime = {
+		streamSimple: () => {
+			calls++;
+			throw new Error("must not call");
+		},
+	};
+	const logs: string[] = [];
+	const restoreLogs = setLogSink((line) => logs.push(line));
+	try {
+		const result = await (rt as any).generateCompactionSummary(
+			{
+				messagesToSummarize: [{ role: "user", content: "private-body-canary".repeat(1000), timestamp: 1 }],
+				turnPrefixMessages: [],
+			},
+			new AbortController().signal,
+		);
+		expect(result).toEqual({ failure: "summary input exceeds model window" });
+		expect(calls).toBe(0);
+		expect(
+			logs.map((line) => JSON.parse(line)).find((line) => line.event === "compaction_input_rejected")?.fields,
+		).toMatchObject({ category: "model_window_exceeded" });
+		expect(logs.join("")).not.toContain("private-body-canary");
+	} finally {
+		restoreLogs();
+		db.close();
+	}
 });

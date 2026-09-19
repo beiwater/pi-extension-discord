@@ -1,8 +1,8 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	estimateTokens,
-	findCutPoint,
 	serializeConversation,
 	sessionEntryToContextMessages,
 	type CompactionResult,
@@ -11,7 +11,12 @@ import {
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { CONTEXT_IMAGE_TOKEN_ESTIMATE } from "../token-packer.ts";
-import { isTelegramContextDetails, TELEGRAM_CONTEXT_TYPE } from "./context.ts";
+import {
+	isTelegramContextDetails,
+	projectTelegramContext,
+	TELEGRAM_CONTEXT_TYPE,
+	type TelegramContextImageResolver,
+} from "./context.ts";
 
 type SessionBeforeCompactResult = { cancel?: boolean; compaction?: CompactionResult };
 
@@ -19,11 +24,39 @@ export function serializeCompactionMessages(messages: AgentMessage[]): string {
 	return serializeConversation(convertToLlm(messages));
 }
 
-/** The subset of Pi's preparation that the cut point decides. */
-export type CompactionCut = Pick<
-	SessionBeforeCompactEvent["preparation"],
-	"firstKeptEntryId" | "messagesToSummarize" | "turnPrefixMessages" | "isSplitTurn"
->;
+/** Preserve image/text order inside the transcript, without the ephemeral sticker catalog. */
+export function buildCompactionContent(
+	messages: AgentMessage[],
+	previousSummary?: string,
+	resolveImage?: TelegramContextImageResolver,
+): string | (TextContent | ImageContent)[] {
+	const ending =
+		`\n</conversation>\n\n` +
+		(previousSummary
+			? `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n把上面的旧摘要与新内容合并成一份更新的摘要。`
+			: "请输出摘要。");
+	if (!resolveImage) return `<conversation>\n${serializeCompactionMessages(messages)}${ending}`;
+	const projected = convertToLlm(projectTelegramContext(messages, resolveImage, false));
+	const content: (TextContent | ImageContent)[] = [];
+	const text = (value: string) => {
+		const last = content.at(-1);
+		if (last?.type === "text") last.text += value;
+		else content.push({ type: "text", text: value });
+	};
+	text("<conversation>\n");
+	for (const message of projected) {
+		if (message.role === "user" && Array.isArray(message.content) && message.content.some((b) => b.type === "image")) {
+			text("[User]: ");
+			for (const block of message.content) {
+				if (block.type === "text") text(block.text);
+				else if (block.type === "image") content.push(block);
+			}
+		} else text(serializeConversation([message]));
+		text("\n\n");
+	}
+	text(ending);
+	return content;
+}
 
 function contextImageCount(entry: SessionEntry): number {
 	if (entry.type !== "custom_message" || entry.customType !== TELEGRAM_CONTEXT_TYPE) return 0;
@@ -44,26 +77,12 @@ function compactionBoundaryStart(entries: readonly SessionEntry[]): number {
 	return 0;
 }
 
-function compactionMessage(entry: SessionEntry): AgentMessage | undefined {
-	return entry.type === "compaction" ? undefined : sessionEntryToContextMessages(entry)[0];
-}
-
 /**
- * Re-cut Pi's preparation so context images count toward `keepRecentTokens`.
- *
- * Telegram context images live in custom-message details and are materialized only at
- * projection time, so Pi's chars/4 estimator sees them as zero and its cut point can retain
- * an unbounded image tail (each image still costs ~CONTEXT_IMAGE_TOKEN_ESTIMATE provider
- * tokens). Walk back from the newest entry charging images, stop at the configured budget,
- * and ask Pi's `findCutPoint` for the valid cut that keeps the same text-only estimate.
- * Everything between Pi's cut and ours moves into the summary input. Never moves the cut
- * earlier than Pi's.
+ * Translate the image-inclusive retention budget into Pi's text-only units BEFORE Pi
+ * prepares compaction. A before-compact handler is too late: Pi returns early if the
+ * text fits, without ever emitting that event. Pi still owns valid cuts and split turns.
  */
-export function imageAwareCompactionCut(
-	entries: readonly SessionEntry[],
-	prep: CompactionCut,
-	keepRecentTokens: number,
-): CompactionCut {
+export function compactionTextBudget(entries: readonly SessionEntry[], keepRecentTokens: number): number {
 	const boundaryStart = compactionBoundaryStart(entries);
 	let piTokens = 0;
 	let chargedTokens = 0;
@@ -76,27 +95,9 @@ export function imageAwareCompactionCut(
 		images += entryImages;
 		chargedTokens += entryTokens + entryImages * CONTEXT_IMAGE_TOKEN_ESTIMATE;
 	}
-	if (images === 0 || chargedTokens < keepRecentTokens || piTokens >= keepRecentTokens) return prep;
-
-	const cut = findCutPoint([...entries], boundaryStart, entries.length, Math.max(1, piTokens));
-	const previousIndex = entries.findIndex((entry) => entry.id === prep.firstKeptEntryId);
-	const firstKeptEntry = entries[cut.firstKeptEntryIndex];
-	if (!firstKeptEntry?.id || cut.firstKeptEntryIndex <= previousIndex) return prep;
-
-	const historyEnd = cut.isSplitTurn ? cut.turnStartIndex : cut.firstKeptEntryIndex;
-	const messagesToSummarize: AgentMessage[] = [];
-	for (let index = boundaryStart; index < historyEnd; index++) {
-		const message = compactionMessage(entries[index]!);
-		if (message) messagesToSummarize.push(message);
-	}
-	const turnPrefixMessages: AgentMessage[] = [];
-	if (cut.isSplitTurn) {
-		for (let index = cut.turnStartIndex; index < cut.firstKeptEntryIndex; index++) {
-			const message = compactionMessage(entries[index]!);
-			if (message) turnPrefixMessages.push(message);
-		}
-	}
-	return { firstKeptEntryId: firstKeptEntry.id, messagesToSummarize, turnPrefixMessages, isSplitTurn: cut.isSplitTurn };
+	return images > 0 && chargedTokens >= keepRecentTokens
+		? Math.min(keepRecentTokens, Math.max(1, piTokens))
+		: keepRecentTokens;
 }
 
 export function makeTelegramCompactionExtension(

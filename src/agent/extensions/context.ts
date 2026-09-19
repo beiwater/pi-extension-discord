@@ -128,6 +128,7 @@ export type TelegramContextImageResolver = (ref: { name: string; mime: string })
 export function projectTelegramContext(
 	messages: AgentMessage[],
 	resolveImage?: TelegramContextImageResolver,
+	includeStickerCandidates = true,
 ): AgentMessage[] {
 	const lastTelegramContext = messages.findLastIndex(
 		(message) => message.role === "custom" && message.customType === TELEGRAM_CONTEXT_TYPE,
@@ -148,7 +149,8 @@ export function projectTelegramContext(
 		}
 		if (message.role !== "custom" || message.customType !== TELEGRAM_CONTEXT_TYPE) return message;
 		if (!isTelegramContextDetails(message.details)) return message;
-		const candidates = index === lastTelegramContext ? message.details.stickerCandidates.trim() : "";
+		const candidates =
+			includeStickerCandidates && index === lastTelegramContext ? message.details.stickerCandidates.trim() : "";
 		const images = message.details.blocks.filter((block) => block.type === "image");
 		if (images.length === 0 || !resolveImage) {
 			// Text-only projection keeps the historical exact-string bytes.

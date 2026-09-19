@@ -38,6 +38,8 @@ bun run debug -- --bot A --show-provider-content  # 敏感：显式读取完整�
 
 报告是线索而非历史证明：旧自由文本log不解析；窗口之外或retention删除的证据会缺失；概率trigger可合法沉默或busy-skip。
 
+`compaction_input` 记录 vision capability、图片附带/缺失计数和输入估算；`compaction_input_rejected{category:model_window_exceeded}` 表示尚未调用 provider。新增诊断不记录正文、图片字节或路径，业务判断不依赖日志。
+
 ## 响应链证据梯
 
 按顺序停止在第一处缺失/失败：

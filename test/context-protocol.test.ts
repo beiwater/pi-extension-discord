@@ -4,7 +4,12 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { findCutPoint, SessionManager, type ModelRuntime } from "@earendil-works/pi-coding-agent";
+import {
+	findCutPoint,
+	SessionManager,
+	sessionEntryToContextMessages,
+	type ModelRuntime,
+} from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import {
 	buildContextFingerprint,
@@ -22,7 +27,7 @@ import {
 	applyAssistantPersistencePolicy,
 	contextImageBytes,
 	estimateCacheReadFromPrefix,
-	imageAwareCompactionCut,
+	compactionTextBudget,
 	observeProviderPayload,
 	projectTelegramContext,
 } from "../src/agent/extensions/index.ts";
@@ -335,21 +340,16 @@ describe("Pi context protocol", () => {
 		// Pi's own cut keeps the whole tail: text alone is far below 20k estimated tokens.
 		const piCut = findCutPoint(entries, 0, entries.length, 20_000);
 		expect(entries[piCut.firstKeptEntryIndex]!.id).toBe(entries[0]!.id);
-		const piPrep = {
-			firstKeptEntryId: entries[0]!.id,
-			messagesToSummarize: [],
-			turnPrefixMessages: [],
-			isSplitTurn: false,
-		};
-		const noImages = imageAwareCompactionCut(entries, piPrep, 20_000);
 		// 16 images ≈ 17.6k charged tokens plus text: still under 20k, so Pi's cut stands.
-		expect(noImages).toBe(piPrep);
-		const cut = imageAwareCompactionCut(entries, piPrep, 6_000);
+		expect(compactionTextBudget(entries, 20_000)).toBe(20_000);
+		const budget = compactionTextBudget(entries, 6_000);
+		expect(budget).toBeLessThan(6_000);
+		const cut = findCutPoint(entries, 0, entries.length, budget);
 		// ~5 images fit; the cut moves past the first album and the discarded turns are summarized.
-		const keptIndex = entries.findIndex((entry) => entry.id === cut.firstKeptEntryId);
+		const keptIndex = cut.firstKeptEntryIndex;
 		expect(keptIndex).toBeGreaterThan(entries.findIndex((entry) => entry.id === firstImageBatch));
 		expect(keptIndex).toBeLessThanOrEqual(entries.findIndex((entry) => entry.id === latest));
-		const summarized = cut.messagesToSummarize.concat(cut.turnPrefixMessages);
+		const summarized = entries.slice(0, keptIndex).flatMap(sessionEntryToContextMessages);
 		expect(summarized.length).toBeGreaterThanOrEqual(3);
 		expect(JSON.stringify(summarized)).toContain("old text");
 		expect(JSON.stringify(summarized)).toContain("photo album");

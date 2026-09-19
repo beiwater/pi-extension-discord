@@ -3,7 +3,7 @@
 
 import { createHash } from "node:crypto";
 
-export const CACHE_SCHEMA_VERSION = 18; // v18: compaction includes discarded split-turn prefixes and preserves active image refs
+export const CACHE_SCHEMA_VERSION = 19; // v19: vision-capable compaction preserves ordered images in the summary input
 
 // Fixed shared protocol is deliberately the first byte of every bot's system prompt so bots in
 // the same provider/cache cohort share the longest possible exact prefix.

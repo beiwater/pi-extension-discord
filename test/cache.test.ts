@@ -33,19 +33,21 @@ import { recentContextStickerCandidates, stickerCatalogPromptBlock } from "../sr
 import {
 	NO_SEND_MARKER,
 	serializeCompactionMessages,
+	buildCompactionContent,
 	TELEGRAM_CONTEXT_TYPE,
 	TELEGRAM_CONTEXT_VERSION,
 	TELEGRAM_EXTENSION_ORDER,
 } from "../src/agent/extensions/index.ts";
 
 const GOLDEN = {
-	schemaVersion: 18,
+	schemaVersion: 19,
 	systemZhTemplate: "b2f0432b9b7b",
 	systemEnTemplate: "231c26fbb95b",
 	serialize: "68a17d6e5c05",
 	eventSerialize: "4a57de738bf9",
 	tools: "c28a3db01190",
 	compactionPrompt: "045a5241fdd7",
+	multimodalCompaction: "e2da2b8b68fa",
 	extensionOrder: "e04f7032d531",
 	contextProtocol: "2e1c7762b239",
 };
@@ -471,6 +473,35 @@ test("complete provider tool protocol + order stable (REQ-TEST-0001 R2)", () => 
 
 test("compaction summary prompt grammar stable (REQ-TEST-0001 R2)", () => {
 	expect(sha256Short(COMPACTION_SUMMARY_PROMPT)).toBe(GOLDEN.compactionPrompt);
+});
+
+test("multimodal summary envelope stays stable", () => {
+	const content = buildCompactionContent(
+		[
+			{
+				role: "custom",
+				customType: TELEGRAM_CONTEXT_TYPE,
+				content: "photo #12",
+				display: false,
+				timestamp: 1,
+				details: {
+					version: TELEGRAM_CONTEXT_VERSION,
+					consumedSeq: 12,
+					providerText: "photo #12",
+					blocks: [
+						{ type: "text", text: "photo #12" },
+						{ type: "image", name: "fixture.png", mime: "image/png" },
+					],
+					stickerCandidates: "must not enter summary",
+					visibleMessageIds: [12],
+					events: [],
+				},
+			},
+		],
+		"previous summary",
+		() => ({ type: "image", data: "Zml4dHVyZQ==", mimeType: "image/png" }),
+	);
+	expect(sha256Short(JSON.stringify(content))).toBe(GOLDEN.multimodalCompaction);
 });
 
 test("compaction serializes custom Telegram messages through Pi", () => {

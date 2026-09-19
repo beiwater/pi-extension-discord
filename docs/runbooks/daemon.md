@@ -27,14 +27,15 @@ bun run status                     # 状态（pid 校验：cmdline 必须是本�
 bun run stop                       # SIGTERM 优雅停止
 ```
 
-生产部署（Linux）用 systemd user unit 托管，崩溃/被 OOM 杀后自动拉起，开机自启：
+生产部署（Linux）用 systemd user unit 托管，可在用户级 manager 存活时自动拉起崩溃的 daemon，并开机自启：
 
 ```bash
 systemctl --user enable --now telegram-agent   # unit: ~/.config/systemd/user/telegram-agent.service
 sudo loginctl enable-linger <user>             # 不登录也随开机启动
 ```
 
-- unit 前台跑 `bun run src/daemon/index.ts`，stdout/stderr 仍追加到 `data/daemon.log`；`Restart=on-failure` + `OOMScoreAdjust=-200`。
+- unit 前台跑 `bun run src/daemon/index.ts`，stdout/stderr 仍追加到 `data/daemon.log`；`Restart=on-failure`。已有 unit 声明的 `OOMScoreAdjust=-200` 不代表实际生效，须检查运行 PID 的 `/proc/<pid>/oom_score_adj`；用户级权限可能无法降低继承值。
+- 全机 OOM 若连用户级 manager 一起杀掉，bot unit 的 Restart 和 linger 都不能保证恢复。先定位资源耗尽来源；需要隔离这一监督失效模式时，按单实例受控迁移到系统级 service，不能并行启动第二个 poller。
 - 与 CLI 不冲突：`bun run stop` 是 SIGTERM 干净退出，不会触发 Restart；日常 `status`/`restart`/`stop` 照旧用 CLI。
 
 

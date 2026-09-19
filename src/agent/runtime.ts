@@ -30,6 +30,7 @@ import {
 	sha256Short,
 	CACHE_SCHEMA_VERSION,
 	COMPACTION_SUMMARY_PROMPT,
+	REPLY_RECOVERY_PROMPT,
 	SHARED_PROTOCOL,
 } from "./prompt.ts";
 import { TOOL_DEFS, toolProtocolHash, type SendParams, type SearchParams } from "./tools.ts";
@@ -179,6 +180,8 @@ export class BotRuntime {
 	private controlCompacting = false;
 	/** Last assistant message ended in error/abort; auto-compaction waits for a healthy turn. */
 	private lastTurnFailed = false;
+	/** Set by the irreversible send boundary, not by provider health or usage telemetry. */
+	private turnSendOutcome: "none" | "sent" | "unknown" = "none";
 	private lastControlCompact: RuntimeControlSnapshot["lastCompact"] = null;
 	private readonly monotonicNow = () => performance.now();
 	private visibleMessageIds = new Set<number>();
@@ -418,10 +421,6 @@ export class BotRuntime {
 			makeAssistantPersistencePolicyExtension(
 				(text) => {
 					this.recordEvent("assistant_text", { text });
-					log.info("agent_runtime", "model_silence", {
-						bot_id: this.bot.id,
-						trigger_message_id: this.currentTriggerMessageId,
-					});
 				},
 				(message) => this.captureAssistantActivity(message),
 			),
@@ -559,6 +558,12 @@ export class BotRuntime {
 					const msg = event.message;
 					if (msg.role === "assistant") {
 						this.lastTurnFailed = msg.stopReason === "error" || msg.stopReason === "aborted";
+						if (this.lastTurnFailed)
+							log.warn("agent_runtime", "provider_attempt_failed", {
+								bot_id: this.bot.id,
+								trigger_message_id: this.currentTriggerMessageId,
+								category: classifyPiProviderFailure(msg.errorMessage ?? "provider failed"),
+							});
 						this.observeThinking(msg, now, true);
 						const thinking = msg.content
 							.filter((c) => c.type === "thinking")
@@ -904,8 +909,8 @@ export class BotRuntime {
 		return { summary, usage: result.usage };
 	}
 
-	private executeSend(params: SendParams) {
-		return executeAgentSend(params, {
+	private async executeSend(params: SendParams) {
+		const result = await executeAgentSend(params, {
 			db: this.db,
 			api: this.api,
 			botId: this.bot.id,
@@ -922,6 +927,9 @@ export class BotRuntime {
 			},
 			recordDuration: (durationMs) => this.recordSendDuration(durationMs),
 		});
+		// Both successful sends and degraded terminal outcomes forbid an automatic resend.
+		this.turnSendOutcome = "outcome" in result.details && result.details.outcome === "unknown" ? "unknown" : "sent";
+		return result;
 	}
 
 	/** Lifecycle state used by deterministic scheduling and the Telegram control plane. */
@@ -946,7 +954,7 @@ export class BotRuntime {
 		let directReplyPending = false;
 		let directReplyMessageId: number | null = null;
 		if (routingTrigger) this.currentTriggerMessageId = routingTrigger.messageId;
-		if (isDirectReply && !this.visibleMessageIds.has(routingTrigger.messageId)) {
+		if (isDirectReply && this.bot.tools.send && !this.visibleMessageIds.has(routingTrigger.messageId)) {
 			const created = createReplyObligation(this.db, this.bot.id, routingTrigger.chatId, routingTrigger.messageId);
 			directReplyPending = true;
 			directReplyMessageId = routingTrigger.messageId;
@@ -1030,6 +1038,8 @@ export class BotRuntime {
 	/** Read a bounded immutable event window, commit its cursor, and wake the agent. */
 	private async flush(): Promise<boolean> {
 		if (!this.session) return false;
+		this.turnSendOutcome = "none";
+		this.lastTurnFailed = false;
 		const chatId = this.config.groupChatId;
 		const obligations = listReplyObligations(this.db, this.bot.id, chatId, MAX_OBLIGATION_SCAN);
 
@@ -1192,22 +1202,41 @@ export class BotRuntime {
 			this.reconcileContextStateFromSession();
 			throw error;
 		}
+		if (
+			!this.lastTurnFailed &&
+			this.turnSendOutcome === "none" &&
+			this.bot.tools.send &&
+			delivered.length > 0 &&
+			delivered.every((obligation) => this.visibleMessageIds.has(obligation.messageId)) &&
+			!this.stopping
+		) {
+			log.info("agent_runtime", "reply_repair_started", {
+				bot_id: this.bot.id,
+				trigger_message_id: this.currentTriggerMessageId,
+				obligation_count: delivered.length,
+			});
+			this.typingLease.start();
+			await this.session.prompt(
+				`${REPLY_RECOVERY_PROMPT}${delivered.map((obligation) => `#${obligation.messageId}`).join(", ")}`,
+			);
+		}
 		log.info("agent_runtime", "provider_turn_settled", {
 			bot_id: this.bot.id,
 			trigger_message_id: this.currentTriggerMessageId,
 			input_events: packed.events.length,
 			provider_calls: this.providerCallsInRun,
+			send_outcome: this.turnSendOutcome,
 		});
 		const activeState = contextStateFromEntries(this.session.sessionManager.buildContextEntries(), highWater);
-		// Pi resolves the turn normally after exhausting retries; the batch is in context but the
-		// model never answered, so a direct address stays owed and re-enters the next flush as a
-		// mandatory event instead of being marked delivered.
-		const turnFailed = this.lastTurnFailed;
-		const deliveredObligationIds = turnFailed ? [] : delivered.map((obligation) => obligation.messageId);
+		// Provider completion is not Telegram delivery. Unknown/partial commits are terminal;
+		// failure or silence without any remote outcome stays owed, without an unbounded loop.
+		const replyPending = this.turnSendOutcome === "none";
+		const deliveredObligationIds = replyPending ? [] : delivered.map((obligation) => obligation.messageId);
 		if (deliveredObligationIds.length > 0) {
 			this.session.sessionManager.appendCustomEntry(TELEGRAM_CONTEXT_COMMIT_TYPE, {
 				consumedSeq: highWater,
 				deliveredObligationIds,
+				outcome: this.turnSendOutcome,
 			});
 		}
 		commitConsumedContext(this.db, {
@@ -1220,15 +1249,24 @@ export class BotRuntime {
 		});
 		this.visibleMessageIds = activeState.visible;
 		await this.maybeAutoCompact();
-		if (turnFailed) {
+		if (replyPending) {
+			if (!this.lastTurnFailed)
+				log.info("agent_runtime", "model_silence", {
+					bot_id: this.bot.id,
+					trigger_message_id: this.currentTriggerMessageId,
+					obligation_count: delivered.length,
+				});
 			for (const obligation of delivered) {
 				this.recordEvent("reply_obligation_retained", { message_id: obligation.messageId });
 			}
-			// Pi already spent the retry budget; do not loop straight back into the provider.
+			// Retry exhaustion or a second silent turn must not loop straight back into the provider.
 			return false;
 		}
 		for (const obligation of delivered) {
-			this.recordEvent("reply_obligation_delivered", { message_id: obligation.messageId });
+			this.recordEvent("reply_obligation_delivered", {
+				message_id: obligation.messageId,
+				outcome: this.turnSendOutcome,
+			});
 		}
 		return replyObligationCount(this.db, this.bot.id, chatId) > 0;
 	}

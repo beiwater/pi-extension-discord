@@ -25,6 +25,7 @@ import {
 	sha256Short,
 	CACHE_SCHEMA_VERSION,
 	COMPACTION_SUMMARY_PROMPT,
+	REPLY_RECOVERY_PROMPT,
 	SHARED_PROTOCOL,
 	TOOL_CAPABILITY_DECLARATION,
 } from "../src/agent/prompt.ts";
@@ -40,7 +41,7 @@ import {
 } from "../src/agent/extensions/index.ts";
 
 const GOLDEN = {
-	schemaVersion: 19,
+	schemaVersion: 20,
 	systemZhTemplate: "b2f0432b9b7b",
 	systemEnTemplate: "231c26fbb95b",
 	serialize: "68a17d6e5c05",
@@ -48,6 +49,7 @@ const GOLDEN = {
 	tools: "c28a3db01190",
 	compactionPrompt: "045a5241fdd7",
 	multimodalCompaction: "e2da2b8b68fa",
+	replyRecovery: "4fc7e277e338",
 	extensionOrder: "e04f7032d531",
 	contextProtocol: "2e1c7762b239",
 };
@@ -475,7 +477,7 @@ test("compaction summary prompt grammar stable (REQ-TEST-0001 R2)", () => {
 	expect(sha256Short(COMPACTION_SUMMARY_PROMPT)).toBe(GOLDEN.compactionPrompt);
 });
 
-test("multimodal summary envelope stays stable", () => {
+test("multimodal summary envelope and bounded reply recovery protocol stay stable", () => {
 	const content = buildCompactionContent(
 		[
 			{
@@ -502,6 +504,7 @@ test("multimodal summary envelope stays stable", () => {
 		() => ({ type: "image", data: "Zml4dHVyZQ==", mimeType: "image/png" }),
 	);
 	expect(sha256Short(JSON.stringify(content))).toBe(GOLDEN.multimodalCompaction);
+	expect(sha256Short(REPLY_RECOVERY_PROMPT)).toBe(GOLDEN.replyRecovery);
 });
 
 test("compaction serializes custom Telegram messages through Pi", () => {

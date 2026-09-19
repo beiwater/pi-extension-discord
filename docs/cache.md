@@ -14,7 +14,9 @@
 
 ## CACHE_SCHEMA_VERSION
 
-当前：**19**。
+当前：**20**。
+
+v20：明确寻址但没有公开发送的健康 turn 最多追加一次固定补答 suffix，仍未发送则保留待办。新增补答指令 golden，主聊天 system/tools/消息序列化 hash 不变。
 
 v19：支持 image 输入的 compaction model 接收待丢弃消息中按原位置交错的图片；不支持时仍只传文字，缺失文件与未传图片以脱敏计数记录。摘要请求超出模型窗口的保守估算时，在 provider 调用前拒绝，不写入残缺摘要。图片计量移到 Pi preparation 之前，Pi 继续拥有合法切点、split-turn 与原生阈值触发。新增摘要 envelope golden，主聊天 system/tools/消息序列化 hash 不变。各次升级均按既有 fingerprint 规则创建新 session/epoch，保留旧 session，不改写旧 prefix；首次请求冷缓存。
 
@@ -152,6 +154,7 @@ Vision 默认关闭；只有显式 `vision.enabled: true` 才会执行。`auxili
 - summary 输入包含 `messagesToSummarize` 和 `turnPrefixMessages`，使用 Pi 的 `serializeConversation(convertToLlm(messages))`，因此 Telegram custom message 与 Pi 原生消息遵循同一 provider projection。
 - 摘要只使用配置的 compaction model，遵守统一 retry 次数、单次完整请求 deadline 和 compaction signal；不切换主模型。空摘要、重试耗尽的 provider failure 或 abort 会 cancel；cursor、visible refs 与 epoch 均不伪造变化。
 - 摘要模型 catalog `input` 包含 `image` 时，复用 context 图片 resolver，在对应消息位置传入图片，覆盖完整丢弃段与 split-turn 前缀；动态 sticker 候选永不进入摘要，base64 不持久化。不支持图片或文件缺失时保留已有文字，不额外逐图调用视觉模型。输入采用 UTF-8 bytes/2 + 1,100/图的保守估算，预留输出与 2,048 安全余量；超窗口拒绝调用，应改用足够窗口的摘要模型。正常聊天无额外调用，压缩时增加实际图片输入成本。
+- direct-address 的完成条件为 send 的 terminal outcome，不是 provider 正常 stop。只有零公开发送、健康 turn、send 已启用且待回复消息仍可见时，最多追加一次带有界消息 ID 的 `REPLY_RECOVERY_PROMPT`；普通概率沉默不补答，provider error 不叠加补答预算。二次沉默留待下一触发，不无限循环；committed/partial/unknown 都不自动重发，unknown 在本地 commit 中单独标识。
 - 成功结果的 structured details 保存当前 `consumedSeq` 与 retained `visibleMessageIds`。runtime 用这些 details 替换 visibility、推进 epoch；`consumedSeq` 永不回退。
 - visibility与epoch提交后，provider外observer按所有当前配置bot的visible refs、未消费event与reply obligation，对本地媒体cache做最多256项回收。它清可再生文件、`local_path`与 `context_files` 派生图片，失败不改变compaction结果；startup backfill复用同一引用边界，避免重新下载已回收历史。
 - 媒体回收不修改session、summary、message/event serialization或provider payload，因此不改变cache schema，也不增加LLM call/token；派生图片可按 `context_files` 记录随时重建。
@@ -173,7 +176,7 @@ Vision 默认关闭；只有显式 `vision.enabled: true` 才会执行。`auxili
 
 | 项目 | 值 |
 | --- | --- |
-| schema | `19` |
+| schema | `20` |
 | zh system | `b2f0432b9b7b` |
 | en system | `231c26fbb95b` |
 | legacy message serializer | `68a17d6e5c05` |
@@ -181,6 +184,7 @@ Vision 默认关闭；只有显式 `vision.enabled: true` 才会执行。`auxili
 | tools | `c28a3db01190` |
 | compaction prompt | `045a5241fdd7` |
 | multimodal compaction envelope | `e2da2b8b68fa` |
+| reply recovery suffix | `4fc7e277e338` |
 | extension order | `e04f7032d531` |
 | context protocol | `2e1c7762b239` |
 | sticker catalog block | exact-string lock（`s<id>: <emoji> <描述>` 行，set/format 不渲染） |

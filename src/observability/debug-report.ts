@@ -137,7 +137,7 @@ export function buildDebugReport(db: Database, input: DebugReportInput) {
 			.all(botId, input.chatId, since, MAX_CLAIMS) as Array<Record<string, string | number>>;
 		const runs = db
 			.query(`
-			SELECT id, ts, epoch, trigger_message_id, public_send_count, tool_followup_rounds,
+			SELECT id, ts, epoch, compaction, trigger_message_id, public_send_count, tool_followup_rounds,
 			       input_events, input_tokens_estimated, rows_scanned, latency_ms,
 			       context_tokens, cache_read, cache_write, cache_read_estimated, cache_miss, output_tokens,
 			       reasoning_tokens, vision_calls, images_attached, system_tokens, tools_tokens,
@@ -223,9 +223,13 @@ export function buildDebugReport(db: Database, input: DebugReportInput) {
 			}
 		}
 		for (const run of bot.runs) {
-			if (run.public_send_count !== 0) continue;
-			const silent = bot.events.some(
-				(event) => event.kind === "assistant_text" && Math.abs(event.ts - Number(run.ts)) <= 120_000,
+			if (run.compaction !== 0 || run.public_send_count !== 0) continue;
+			const silent = bot.logs.some(
+				(record) =>
+					record.component === "agent_runtime" &&
+					record.event === "model_silence" &&
+					record.fields?.trigger_message_id === run.trigger_message_id &&
+					Math.abs(Date.parse(record.ts) - Number(run.ts)) <= 120_000,
 			);
 			if (silent)
 				findings.push({

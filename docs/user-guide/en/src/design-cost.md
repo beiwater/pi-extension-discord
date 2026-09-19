@@ -10,6 +10,8 @@ Local code handles mentions, replies, configured names, and HMAC probability buc
 
 This avoids an entire unnecessary call instead of shaving a few tokens after starting one. See [Routing architecture](https://github.com/mizorewww/pi-extension-telegram-agent/blob/main/docs/architecture.md).
 
+A healthy direct-address turn (@mention, reply, or configured name) with no public send gets at most one repair turn, provided the addressed messages remain visible. Further silence stays pending instead of looping. Sent, partially sent, and unknown Telegram outcomes are never automatically resent. Ordinary probabilistic silence adds no call.
+
 ## 2. A stable provider prefix reuses cache
 
 The shared protocol comes first, followed by the persona, then a bounded sticker catalog, then fixed-order tool schemas. This maximizes the byte-identical prefix shared by bots. The catalog holds capped `s<id>: <emoji> <description>` lines (the description is the persisted vision text, degrading to `s<id>: <emoji>` then `s<id>` when absent; set names and formats never appear in model-visible text) and remains pinned. A separate list of at most eight recent user stickers that are visible in the current context and sendable by this bot is stored independently, rendered with the same line grammar. The provider sees it once, after the latest Telegram batch, rather than repeated after every historical batch. It is omitted when the suffix budget cannot fit it. All three formats are sent with Telegram's original file id.

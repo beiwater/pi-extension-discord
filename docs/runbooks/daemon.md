@@ -142,6 +142,6 @@ bun run pi                          # 从项目依赖启动 Pi，自动加载 Te
 
 ## 本次升级与恢复行为
 
-Linux 使用 /proc、macOS 使用系统 ps/lsof 验证 daemon 入口与工作目录。本次 cache schema 19 升级会创建新上下文 epoch，保留旧 session 文件；不新增数据库 schema 或 IPC 迁移。已有 pending dispatch 在拉取新 update 前恢复，可从 debug 的同名字段检查，不需要手动重放 Telegram update。
+Linux 使用 /proc、macOS 使用系统 ps/lsof 验证 daemon 入口与工作目录。本次 cache schema 20 升级会创建新上下文 epoch，保留旧 session 文件；不新增数据库 schema 或 IPC 迁移。已有 pending dispatch 在拉取新 update 前恢复，可从 debug 的同名字段检查，不需要手动重放 Telegram update。
 
 聊天与摘要共用 provider_retries；0 禁止额外尝试。摘要只使用配置模型，故障不切换主模型，取消/停止可终止请求。手工发送返回 unknown_outcome 时先检查群内是否已出现消息，再决定是否另发，不能把它当作明确未发送。

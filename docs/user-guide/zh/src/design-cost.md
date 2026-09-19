@@ -10,6 +10,8 @@ mention、reply、配置名称和HMAC概率桶都由本地代码判断。普通�
 
 这样减少的是整个无意义调用，而不是在调用后省几个token。权威行为见[架构的 Routing 章节](https://github.com/mizorewww/pi-extension-telegram-agent/blob/main/docs/architecture.md)。
 
+明确 @、回复或点名后的正常 turn 如果没有公开发送，且原消息仍在上下文，最多补答一次；仍未回应会保留待回复状态，不无限重试。已发送、部分发送或结果未知时不会自动重复发送。普通概率沉默不增加调用。
+
 ## 2. Stable provider prefix 复用cache
 
 共享协议位于最前，persona随后，末尾是有界的 sticker 目录，再之后是固定顺序tool schema，让多只bot尽可能共享逐字节相同的prefix。固定目录每行为 `s<id>: <emoji> <描述>`（描述取持久化 vision 文本，缺失时逐级降级为 `s<id>: <emoji>`、`s<id>`；set 名与格式不进入模型可见文本），并有条数上限。另一份最多8条的动态候选只取当前context真正可见、且该bot可发送的最近用户sticker，行格式与目录一致。候选在session中独立保存，provider只在最后一批Telegram消息之后看到一次，不会在每个历史消息批次后重复；suffix预算不足时整体省略。三种格式都通过Telegram原始file id发送。

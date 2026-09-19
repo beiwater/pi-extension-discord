@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BotRuntime } from "../src/agent/runtime.ts";
 import type { AppConfig, BotConfig } from "../src/config.ts";
+import type { BotApi } from "../src/telegram/api.ts";
 import {
 	createAgentSession,
 	DefaultResourceLoader,
@@ -89,14 +90,24 @@ interface Harness {
 	sent: string[];
 }
 
-function setup(): Harness {
+function setup(publicSend = true): Harness {
 	const db = new Database(":memory:");
 	db.exec(readFileSync("src/db/schema.sql", "utf8"));
 	const bot = makeBot();
 	const config = makeConfig(bot);
 	const modelRuntime = { getModel: () => fakeModel() } as unknown as ModelRuntime;
 	const sent: string[] = [];
+	let sentId = 90000;
 	const rt = new BotRuntime(db, bot, config, modelRuntime, {
+		api: {
+			sendMessageWithEntities: async () => ({
+				chat: { id: CHAT_ID },
+				message_id: ++sentId,
+				date: 100,
+				from: { id: 123, is_bot: true, first_name: "Bot" },
+				text: "fixture reply",
+			}),
+		} as unknown as BotApi,
 		chatActionSender: async () => {},
 		videoTranscoder: { ffmpeg: false, ffprobe: false },
 	});
@@ -109,6 +120,21 @@ function setup(): Harness {
 		sendCustomMessage: async (message: { customType: string; content: string; display: boolean; details: unknown }) => {
 			sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
 			sent.push(message.content);
+			if (publicSend) {
+				const result = await (rt as any).executeSend({ message: "fixture reply" });
+				sessionManager.appendMessage({
+					role: "toolResult",
+					toolName: "send",
+					toolCallId: "fixture-send",
+					content: result.content,
+					details: result.details,
+					isError: false,
+					timestamp: Date.now(),
+				});
+			}
+		},
+		prompt: async () => {
+			throw new Error("unexpected repair turn");
 		},
 	};
 	return { rt, db, sent };
@@ -161,7 +187,7 @@ test("a provider turn that ends in error keeps the direct-address obligation and
 	// Pi resolves the turn normally after exhausting retries (final assistant stopReason
 	// "error"). Production 429s then marked @mentions delivered without any reply and wrote
 	// one zero-usage llm_runs row per failed attempt.
-	const { rt, db, sent } = setup();
+	const { rt, db, sent } = setup(false);
 	const messageId = 1006;
 	insertMessage(db, messageId, "hello @bot");
 	const session = (rt as any).session;
@@ -197,6 +223,7 @@ test("a provider turn that ends in error keeps the direct-address obligation and
 		await send(message);
 		events?.({ type: "agent_start" });
 		events?.({ ...failedTurn, message: { ...failedTurn.message, stopReason: "stop" } });
+		await (rt as any).executeSend({ message: "fixture reply" });
 		events?.({ type: "agent_settled" });
 	};
 	expect(rt.trigger("explicit")).toBe("started");
@@ -240,7 +267,7 @@ test("W2: a trigger arriving in the flushLoop teardown window is not stranded", 
 	let raced = false;
 	let raceResult: string | null = null;
 	lease.stop = () => {
-		if (!raced) {
+		if (!raced && obligationCount(db) === 0) {
 			raced = true;
 			// Runs inside flushLoop's finally: the do-while has already exited but the
 			// outer .finally() has not yet cleared `flushing` — the exact race window.
@@ -419,6 +446,61 @@ test("compaction telemetry failure cancels explicitly instead of enabling Pi's d
 	expect(await (rt as any).handleBeforeCompact({ preparation: {}, signal: new AbortController().signal })).toEqual({
 		cancel: true,
 	});
+});
+
+test("a silent direct-address turn gets only one repair attempt and remains owed until a public send", async () => {
+	const { rt, db } = setup(false);
+	insertMessage(db, 9020, "hello @bot");
+	const session = (rt as any).session;
+	let repairs = 0;
+	session.prompt = async () => {
+		repairs++;
+	};
+	rt.trigger("explicit", { reason: "reply", chatId: CHAT_ID, messageId: 9020 });
+	await (rt as any).flushPromise;
+	expect(repairs).toBe(1);
+	expect(obligationCount(db)).toBe(1);
+	expect((rt as any).flushing).toBe(false);
+	session.prompt = async () => {
+		repairs++;
+		await (rt as any).executeSend({ message: "fixture reply" });
+	};
+	rt.trigger("explicit");
+	await (rt as any).flushPromise;
+	expect(repairs).toBe(2);
+	expect(obligationCount(db)).toBe(0);
+	db.close();
+});
+
+test("an unknown Telegram create closes the obligation without any automatic resend", async () => {
+	const { rt, db } = setup(false);
+	insertMessage(db, 9021, "hello @bot");
+	let creates = 0;
+	(rt as any).api = {
+		sendMessageWithEntities: async () => {
+			creates++;
+			throw new TypeError("connection lost");
+		},
+	};
+	const session = (rt as any).session;
+	const send = session.sendCustomMessage;
+	session.sendCustomMessage = async (message: unknown) => {
+		await send(message);
+		const result = await (rt as any).executeSend({ message: "fixture reply" });
+		expect(result.details.outcome).toBe("unknown");
+	};
+	let repairs = 0;
+	session.prompt = async () => {
+		repairs++;
+	};
+	rt.trigger("explicit", { reason: "explicit", chatId: CHAT_ID, messageId: 9021 });
+	await (rt as any).flushPromise;
+	expect(creates).toBe(1);
+	expect(repairs).toBe(0);
+	expect(obligationCount(db)).toBe(0);
+	const commits = session.sessionManager.getBranch().filter((e: any) => e.customType === "telegram_context_commit_v2");
+	expect(commits.at(-1).data).toMatchObject({ outcome: "unknown", deliveredObligationIds: [9021] });
+	db.close();
 });
 
 function assistantResult(input = 100) {

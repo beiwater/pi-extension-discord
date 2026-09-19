@@ -32,13 +32,13 @@ bun run debug -- --bot A --show-provider-content  # 敏感：显式读取完整�
 | `cursor_backlog` | 该bot尚未消费全部immutable events | 看最近claim与runtime state；没有trigger时可正常 |
 | `pending_reply_obligation` | direct address（explicit @mention / reply / 配置名称点名）尚未被structured commit确认交付 | 查flush/provider失败；restart后应自动recover |
 | `route_without_run` | started claim超过120秒仍无匹配`llm_runs.trigger_message_id` | 查`agent_runtime.flush_failed`与provider readiness |
-| `model_silence` | run完成、公开send为0，且附近有`assistant_text` | 模型主动沉默，不是Telegram传输失败 |
+| `model_silence` | 主聊天run公开send为0，且同一trigger附近有已settled的`model_silence`日志（包括`[no_send]`） | 明确寻址最多补答一次，仍无发送保留obligation；不能仅凭LOCAL文本认定沉默 |
 | `tool_preflight_failed` | send在Telegram create前被本地确定性拒绝 | 按category修输入/visibility/catalog，不查Telegram |
 | `send_degraded` | create结果处于committed/partial/unknown边界 | `committed/partial/unknown`都不得自动重试；按stage修本地副作用 |
 
 报告是线索而非历史证明：旧自由文本log不解析；窗口之外或retention删除的证据会缺失；概率trigger可合法沉默或busy-skip。
 
-`compaction_input` 记录 vision capability、图片附带/缺失计数和输入估算；`compaction_input_rejected{category:model_window_exceeded}` 表示尚未调用 provider。新增诊断不记录正文、图片字节或路径，业务判断不依赖日志。
+`compaction_input` 记录 vision capability、图片附带/缺失计数和输入估算；`compaction_input_rejected{category:model_window_exceeded}` 表示尚未调用 provider。`reply_repair_started` 表示明确寻址的一次补答；`provider_turn_settled.send_outcome` 区分 none/sent/unknown，不能把 unknown 当已确认送达。所有新增诊断保持零正文、零图片字节、零路径，业务判断不依赖日志。
 
 ## 响应链证据梯
 

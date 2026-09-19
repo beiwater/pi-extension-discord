@@ -3,7 +3,7 @@
 
 import { createHash } from "node:crypto";
 
-export const CACHE_SCHEMA_VERSION = 19; // v19: vision-capable compaction preserves ordered images in the summary input
+export const CACHE_SCHEMA_VERSION = 20; // v20: silent direct addresses receive one bounded reply-recovery suffix
 
 // Fixed shared protocol is deliberately the first byte of every bot's system prompt so bots in
 // the same provider/cache cohort share the longest possible exact prefix.
@@ -53,6 +53,10 @@ export const COMPACTION_SUMMARY_PROMPT = `你在为一个长期住在 Telegram �
 - 这个人设真正会关心的信息
 
 输出中文，分段，直接给摘要正文，控制在 800 字以内。`;
+
+/** One bounded repair of an otherwise healthy but unpublished direct-address turn. */
+export const REPLY_RECOVERY_PROMPT =
+	"以下当前可见消息是在直接与你对话，但本轮尚未调用 send 公开回应。请按人设回应，并通过一次最终 send 发送；普通 Assistant 文本不会发送到群里。待回应消息：";
 
 export function sha256Short(text: string): string {
 	return createHash("sha256").update(text).digest("hex").slice(0, 12);

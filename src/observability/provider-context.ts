@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { SessionManager, buildSessionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { DebugDeploymentIdentity } from "../config.ts";
@@ -73,11 +74,27 @@ export function inspectProviderContext(
 		deployment.dataDir,
 	);
 	const context = buildSessionContext(manager.getBranch(), manager.getLeafId());
-	const messages = projectTelegramContext(context.messages);
+	const images = { referenced: 0, available: 0, missing: 0, bytes: 0 };
+	const messages = projectTelegramContext(context.messages, (ref) => {
+		images.referenced++;
+		try {
+			const size = statSync(join(deployment.dataDir, "media", ref.name)).size;
+			if (size === 0) {
+				images.missing++;
+				return null;
+			}
+			images.available++;
+			images.bytes += size;
+			return { type: "image", mimeType: ref.mime, data: "<image bytes omitted>" };
+		} catch {
+			images.missing++;
+			return null;
+		}
+	});
 	const lastRun = db
 		.query(`
 		SELECT provider, api, model, tools_hash AS toolsHash
-		  FROM llm_runs WHERE bot_id = ? ORDER BY id DESC LIMIT 1
+		  FROM llm_runs WHERE bot_id = ? AND compaction = 0 ORDER BY id DESC LIMIT 1
 	`)
 		.get(botId) as {
 		provider: string | null;
@@ -116,6 +133,7 @@ export function inspectProviderContext(
 			...(includeContent ? { content: system } : { content: "<omitted; pass --show-provider-content --bot ID>" }),
 		},
 		tools,
+		images,
 		messages: messages.map((message, index) => ({
 			...messageMetadata(message, index),
 			...(includeContent ? { content: (message as AgentMessage & { content?: unknown }).content } : {}),

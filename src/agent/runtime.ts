@@ -173,6 +173,7 @@ export class BotRuntime {
 	// into `pendingTrigger`; the flush loop drains it (burst-merge semantics unchanged).
 	private flushing = false;
 	private pendingTrigger = false;
+	private pendingTriggerMessageId: number | null = null;
 	private stopping = false;
 	private flushPromise: Promise<void> | null = null;
 	private cooldownUntil = 0;
@@ -953,7 +954,6 @@ export class BotRuntime {
 			(routingTrigger.reason === "explicit" || routingTrigger.reason === "reply" || routingTrigger.reason === "name");
 		let directReplyPending = false;
 		let directReplyMessageId: number | null = null;
-		if (routingTrigger) this.currentTriggerMessageId = routingTrigger.messageId;
 		if (isDirectReply && this.bot.tools.send && !this.visibleMessageIds.has(routingTrigger.messageId)) {
 			const created = createReplyObligation(this.db, this.bot.id, routingTrigger.chatId, routingTrigger.messageId);
 			directReplyPending = true;
@@ -967,18 +967,22 @@ export class BotRuntime {
 		}
 		if (this.controlCompacting) {
 			this.pendingTrigger = true;
+			this.pendingTriggerMessageId = routingTrigger?.messageId ?? this.pendingTriggerMessageId;
 			return "coalesced";
 		}
 		if (this.flushing) {
 			// re-entrant trigger while a flush is in flight (e.g. slow media download):
 			// coalesce into pendingTrigger; the loop picks it up (burst merge, R1)
 			this.pendingTrigger = true;
+			this.pendingTriggerMessageId = routingTrigger?.messageId ?? this.pendingTriggerMessageId;
 			if (directReplyPending && directReplyMessageId != null) {
 				this.recordEvent("reply_obligation_coalesced", { message_id: directReplyMessageId });
 			}
 			return "coalesced";
 		}
 		if (source === "probability") this.cooldownAfterFlush = true;
+		this.currentTriggerMessageId = routingTrigger?.messageId ?? this.pendingTriggerMessageId;
+		this.pendingTriggerMessageId = null;
 		this.flushing = true; // set synchronously, before any await — never gated on SDK events
 		log.info("agent_runtime", "flush_started", {
 			bot_id: this.bot.id,
@@ -1026,6 +1030,8 @@ export class BotRuntime {
 		try {
 			let moreReplies = false;
 			do {
+				if (this.pendingTriggerMessageId != null) this.currentTriggerMessageId = this.pendingTriggerMessageId;
+				this.pendingTriggerMessageId = null;
 				this.pendingTrigger = false;
 				this.typingLease.start();
 				moreReplies = await this.flush();
@@ -1181,7 +1187,7 @@ export class BotRuntime {
 				fullMessageVisible: event.kind === "message" || event.kind === "edit",
 			})),
 		};
-		this.currentTriggerMessageId = packed.events.at(-1)?.messageId ?? this.currentTriggerMessageId;
+		this.currentTriggerMessageId ??= delivered[0]?.messageId ?? packed.events.at(-1)?.messageId ?? null;
 		this.pendingInputMetrics = {
 			inputEvents: packed.events.length,
 			estimatedTokens: packed.estimatedTokens + boundedStickerCandidateTokens,

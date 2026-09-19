@@ -53,6 +53,24 @@ test("all mentions outrank replies regardless of bot ordering, including caption
 	}
 });
 
+test("route diagnostics find matching chat runs outside the latest sample and ignore summaries", () => {
+	const now = Date.now();
+	for (const messageId of [1, 2])
+		db.query(`INSERT INTO routing_claims
+		(chat_id, message_id, bot_id, route_version, reason, status, created_at, updated_at)
+		VALUES (?, ?, 'A', 1, 'reply', 'started', ?, ?)`).run(chatId, messageId, now - 300000, now - 300000);
+	const run = db.query(`INSERT INTO llm_runs (bot_id, ts, model, epoch, trigger_message_id, compaction)
+		VALUES ('A', ?, 'fixture', 1, ?, ?)`);
+	run.run(now - 290000, 1, 0);
+	run.run(now - 290000, 2, 1);
+	for (let i = 0; i < 25; i++) run.run(now - 1000 + i, 100 + i, 0);
+	const report = buildDebugReport(db, { botIds: ["A"], chatId, sinceMs: 3600000, now });
+	expect(report.bots[0]?.runs).toHaveLength(20);
+	expect(
+		report.findings.filter((finding) => finding.code === "route_without_run").map((finding) => finding.message_id),
+	).toEqual([2]);
+});
+
 test("older edits from a delayed poller cannot roll canonical or event history backward", () => {
 	ingestUpdate(db, "A", { update_id: 1, message }, chatId, true);
 	ingestUpdate(db, "A", { update_id: 2, edited_message: { ...message, text: "new", edit_date: 300 } }, chatId, true);

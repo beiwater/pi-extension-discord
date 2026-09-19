@@ -503,6 +503,15 @@ test("an unknown Telegram create closes the obligation without any automatic res
 	db.close();
 });
 
+test("busy probability routing cannot overwrite the in-flight trigger identity", () => {
+	const { rt, db } = setup();
+	(rt as any).flushing = true;
+	(rt as any).currentTriggerMessageId = 77;
+	expect(rt.trigger("probability", { reason: "probability", chatId: CHAT_ID, messageId: 88 })).toBe("skipped_busy");
+	expect((rt as any).currentTriggerMessageId).toBe(77);
+	db.close();
+});
+
 function assistantResult(input = 100) {
 	return {
 		role: "assistant" as const,

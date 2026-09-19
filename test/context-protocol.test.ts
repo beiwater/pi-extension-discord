@@ -1,6 +1,7 @@
 // Pure Pi extension and cache-identity contracts from review-260808.
 
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +34,10 @@ import {
 } from "../src/agent/extensions/index.ts";
 import { CONTEXT_IMAGE_TOKEN_ESTIMATE } from "../src/agent/token-packer.ts";
 import { fitContextBreakdown } from "../src/observability/usage.ts";
+import { inspectProviderContext } from "../src/observability/provider-context.ts";
+import { setSessionManifest } from "../src/db/message-events.ts";
+import { readFileSync } from "node:fs";
+import type { DebugDeploymentIdentity } from "../src/config.ts";
 
 function fingerprintInput(): ContextFingerprintInput {
 	return {
@@ -60,6 +65,72 @@ function fingerprintInput(): ContextFingerprintInput {
 }
 
 describe("Pi context protocol", () => {
+	test("provider inspection reports image availability without bytes and ignores summary model metadata", () => {
+		const root = mkdtempSync(join(tmpdir(), "tg-inspect-context-"));
+		const db = new Database(":memory:");
+		db.exec(readFileSync("src/db/schema.sql", "utf8"));
+		mkdirSync(join(root, "media"));
+		writeFileSync(join(root, "media", "present.png"), "image-bytes-canary");
+		writeFileSync(join(root, "persona.md"), "persona-canary");
+		const manager = SessionManager.create(root, join(root, "sessions", "A"));
+		manager.appendCustomMessageEntry("telegram_context_v2", "body-canary", false, {
+			version: 4,
+			consumedSeq: 1,
+			providerText: "body-canary",
+			visibleMessageIds: [1],
+			events: [],
+			stickerCandidates: "",
+			blocks: [
+				{ type: "text", text: "body-canary" },
+				...["present.png", "missing.png"].map((name) => ({ type: "image", name, mime: "image/png" })),
+			],
+		});
+		manager.appendMessage({
+			role: "assistant",
+			content: [],
+			api: "openai-completions",
+			provider: "chat",
+			model: "chat",
+			usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1, cost: { total: 0 } },
+			stopReason: "stop",
+			timestamp: 1,
+		} as never);
+		setSessionManifest(db, {
+			botId: "A",
+			sessionId: manager.getSessionId(),
+			sessionFile: manager.getSessionFile()!,
+			contextFingerprint: "fixture",
+			createdAt: 1,
+		});
+		db.query(
+			`INSERT INTO llm_runs (bot_id, ts, model, epoch, api, tools_hash, compaction) VALUES ('A', 1, 'chat', 1, 'chat-api', 'chat-tools', 0), ('A', 2, 'summary', 2, 'summary-api', '', 1)`,
+		).run();
+		const deployment = {
+			dataDir: root,
+			bots: [
+				{
+					id: "A",
+					personaPath: join(root, "persona.md"),
+					provider: "chat",
+					model: "chat",
+					tools: { send: true, search: false, runJs: false },
+					stickerSets: [],
+					cacheRetention: "short",
+				},
+			],
+		} as unknown as DebugDeploymentIdentity;
+		try {
+			const report = inspectProviderContext(db, deployment, "A");
+			expect(report.images).toMatchObject({ referenced: 2, available: 1, missing: 1 });
+			expect(report.messages[0]?.content_types).toEqual(["text", "image"]);
+			expect(report.request_metadata).toMatchObject({ api: "chat-api", last_observed_tools_hash: "chat-tools" });
+			for (const canary of ["image-bytes-canary", "body-canary", "persona-canary", "present.png"])
+				expect(JSON.stringify(report)).not.toContain(canary);
+		} finally {
+			db.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 	test("loads user-installed provider extensions into the daemon model runtime", async () => {
 		const root = mkdtempSync(join(tmpdir(), "tg-provider-extension-"));
 		const agentDir = join(root, "agent");

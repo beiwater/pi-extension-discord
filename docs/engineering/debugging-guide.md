@@ -31,14 +31,14 @@ bun run debug -- --bot A --show-provider-content  # 敏感：显式读取完整�
 | `video_transcoder_unavailable` | 当前模式需要视频抽帧（vision已启用或context模式），但PATH缺少`ffmpeg`或`ffprobe`；finding同时给出`impact=video_recognition_disabled`与`action=install_ffmpeg_and_restart` | 安装FFmpeg发行包并restart；它只用于视频抽帧，缺失时vision模式跳过视频识别、context模式视频降级为文本占位，daemon、聊天、图片链路与sticker发送不受影响 |
 | `cursor_backlog` | 该bot尚未消费全部immutable events | 看最近claim与runtime state；没有trigger时可正常 |
 | `pending_reply_obligation` | direct address（explicit @mention / reply / 配置名称点名）尚未被structured commit确认交付 | 查flush/provider失败；restart后应自动recover |
-| `route_without_run` | started claim超过120秒仍无匹配`llm_runs.trigger_message_id` | 查`agent_runtime.flush_failed`与provider readiness |
+| `route_without_run` | started claim超过120秒仍无匹配的主聊天`llm_runs.trigger_message_id`，查询独立于最近20条run展示样本 | 查`agent_runtime.flush_failed`、`provider_attempt_failed`与provider readiness |
 | `model_silence` | 主聊天run公开send为0，且同一trigger附近有已settled的`model_silence`日志（包括`[no_send]`） | 明确寻址最多补答一次，仍无发送保留obligation；不能仅凭LOCAL文本认定沉默 |
 | `tool_preflight_failed` | send在Telegram create前被本地确定性拒绝 | 按category修输入/visibility/catalog，不查Telegram |
 | `send_degraded` | create结果处于committed/partial/unknown边界 | `committed/partial/unknown`都不得自动重试；按stage修本地副作用 |
 
 报告是线索而非历史证明：旧自由文本log不解析；窗口之外或retention删除的证据会缺失；概率trigger可合法沉默或busy-skip。
 
-`compaction_input` 记录 vision capability、图片附带/缺失计数和输入估算；`compaction_input_rejected{category:model_window_exceeded}` 表示尚未调用 provider。`reply_repair_started` 表示明确寻址的一次补答；`provider_turn_settled.send_outcome` 区分 none/sent/unknown，不能把 unknown 当已确认送达。所有新增诊断保持零正文、零图片字节、零路径，业务判断不依赖日志。
+provider-context 的 `images` 统计引用、可用、缺失数量及文件字节；可用图片出现在对应消息的 content types 中，但即使显式显示正文也只输出图片占位，不读出 base64。主聊天 API/tools 元数据排除摘要 run。`compaction_input` 记录 vision capability、图片附带/缺失计数和输入估算；`compaction_input_rejected{category:model_window_exceeded}` 表示尚未调用 provider。`reply_repair_started` 表示明确寻址的一次补答；`provider_turn_settled.send_outcome` 区分 none/sent/unknown，不能把 unknown 当已确认送达。所有新增诊断保持零正文、零图片字节、零路径，业务判断不依赖日志。
 
 ## 响应链证据梯
 

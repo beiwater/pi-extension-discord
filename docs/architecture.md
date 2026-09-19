@@ -64,7 +64,7 @@
 
 - provider watchdog 只负责单次请求从创建 stream 到消费结束的 deadline 与取消；聊天使用 Pi session retry，摘要使用 Pi `retryAssistantCall`，共用 `provider_retries`，adapter retry 设为 0。摘要只请求配置的 compaction model，传递 compaction signal，停止时 abortCompaction，不另切主模型。摘要覆盖 Pi 丢弃的完整消息及 split-turn 前缀。
 - 上下文图片只存在 `custom_message.details`，Pi 的 chars/4 cut point 对它们计 0。runtime 在 Pi preparation **之前**把图片成本换算成临时文本保留预算：原生自动路径用 `agent_end`，手动/图片压力路径在 `compact()` 前更新；settled/finally 恢复配置值。合法切点、split-turn、阈值/overflow 与 retry 仍由 Pi 原生拥有，不在扩展中重建 preparation。post-turn hook 只看额外的图片字节压力，provider 失败时跳过该 hook。摘要模型支持 image 时，按原消息位置投影待丢弃图片，且排除动态 sticker 候选；输入超摘要模型窗口时拒绝调用，保留原状态。runtime 不删除图片，统一由 media lifecycle 按跨 bot 引用回收。估算、退化与成本边界见 [Cache 工程](cache.md)。
-- direct-address obligation 只在 send 返回 terminal outcome 后结清；unknown/partial/committed 均禁止自动重发，unknown 独立记入本地 commit outcome。健康但零 send 的 turn 在待回复消息仍可见时最多获得一次补答机会；再次沉默或 provider 失败保留 obligation 并结束，不把 `replyObligationCount > 0` 变成无限调用循环。send 被禁用的观察 bot 不新建回复 obligation。
+- direct-address obligation 只在 send 返回 terminal outcome 后结清；unknown/partial/committed 均禁止自动重发，unknown 独立记入本地 commit outcome。健康但零 send 的 turn 在待回复消息仍可见时最多获得一次补答机会；再次沉默或 provider 失败保留 obligation 并结束，不把 `replyObligationCount > 0` 变成无限调用循环。send 被禁用的观察 bot 不新建回复 obligation。当前 trigger ID 在整个 flush 内固定，busy/cooldown 跳过不修改它，合并的新 trigger 另存待处理身份。
 
 ## run_js sandbox 威胁模型
 

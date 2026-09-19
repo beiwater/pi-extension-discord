@@ -129,8 +129,10 @@ export function buildDebugReport(db: Database, input: DebugReportInput) {
 		).value;
 		const claims = db
 			.query(`
-			SELECT message_id, route_version, reason, status, created_at, updated_at
-			  FROM routing_claims
+			SELECT message_id, route_version, reason, status, created_at, updated_at,
+			       EXISTS(SELECT 1 FROM llm_runs r WHERE r.bot_id = c.bot_id
+			         AND r.trigger_message_id = c.message_id AND r.compaction = 0 AND r.ts >= c.created_at) AS has_run
+			  FROM routing_claims c
 			 WHERE bot_id = ? AND chat_id = ? AND updated_at >= ?
 			 ORDER BY updated_at DESC, message_id DESC LIMIT ?
 		`)
@@ -218,7 +220,7 @@ export function buildDebugReport(db: Database, input: DebugReportInput) {
 			});
 		for (const claim of bot.claims) {
 			if (claim.status !== "started" || Number(claim.updated_at) > now - 120_000) continue;
-			if (!bot.runs.some((run) => run.trigger_message_id === claim.message_id)) {
+			if (!claim.has_run) {
 				findings.push({ code: "route_without_run", bot_id: bot.bot_id, message_id: Number(claim.message_id) });
 			}
 		}

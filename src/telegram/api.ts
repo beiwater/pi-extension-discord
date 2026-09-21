@@ -130,6 +130,15 @@ export class BotApi {
 		});
 	}
 
+	/** Bots get one non-paid reaction per message; re-setting the same emoji is idempotent. */
+	setMessageReaction(chatId: number, messageId: number, emoji: string): Promise<true> {
+		return this.call<true>("setMessageReaction", {
+			chat_id: chatId,
+			message_id: messageId,
+			reaction: [{ type: "emoji", emoji }],
+		});
+	}
+
 	/** Current deployment's group-capable processing indicator; draft Thinking is private-only. */
 	sendChatAction(chatId: number, signal?: AbortSignal): Promise<true> {
 		return this.call<true>("sendChatAction", { chat_id: chatId, action: "typing" }, CHAT_ACTION_TIMEOUT_MS, signal);
@@ -152,4 +161,90 @@ export class BotApi {
 		if (!res.ok) throw new TelegramApiError(res.status, `file download failed: ${filePath}`);
 		return new Uint8Array(await res.arrayBuffer());
 	}
+}
+
+// The fixed ReactionTypeEmoji enum (https://core.telegram.org/bots/api#reactiontypeemoji,
+// captured 2026-09-21). Both sides strip U+FE0F variation selectors, so "❤" and "❤️"
+// spellings of the same emoji are equivalent; ZWJ sequences stay explicit.
+const REACTION_EMOJIS: ReadonlySet<string> = new Set(
+	[
+		"❤",
+		"👍",
+		"👎",
+		"🔥",
+		"🥰",
+		"👏",
+		"😁",
+		"🤔",
+		"🤯",
+		"😱",
+		"🤬",
+		"😢",
+		"🎉",
+		"🤩",
+		"🤮",
+		"💩",
+		"🙏",
+		"👌",
+		"🕊",
+		"🤡",
+		"🥱",
+		"🥴",
+		"😍",
+		"🐳",
+		"❤\u200d🔥",
+		"🌚",
+		"🌭",
+		"💯",
+		"🤣",
+		"⚡",
+		"🍌",
+		"🏆",
+		"💔",
+		"🤨",
+		"😐",
+		"🍓",
+		"🍾",
+		"💋",
+		"🖕",
+		"😈",
+		"😴",
+		"😭",
+		"🤓",
+		"👻",
+		"👨\u200d💻",
+		"👀",
+		"🎃",
+		"🙈",
+		"😇",
+		"😨",
+		"🤝",
+		"✍",
+		"🤗",
+		"🫡",
+		"🎅",
+		"🎄",
+		"☃",
+		"💅",
+		"🤪",
+		"🗿",
+		"🆒",
+		"💘",
+		"🙉",
+		"🦄",
+		"😘",
+		"💊",
+		"🙊",
+		"😎",
+		"👾",
+		"🤷\u200d♂",
+		"🤷",
+		"🤷\u200d♀",
+		"😡",
+	].map((emoji) => emoji.replaceAll("\ufe0f", "")),
+);
+
+/** Telegram rejects any emoji outside its fixed reaction enum with REACTION_INVALID. */
+export function isReactionEmoji(value: string): boolean {
+	return REACTION_EMOJIS.has(value.replaceAll("\ufe0f", ""));
 }

@@ -105,7 +105,7 @@ model、reasoning、cache policy、persona、tools、serializer、`media.mode`�
 
 `tools`：
 
-- `send`：允许agent发送本地转换为Telegram message entities的Markdown文字，以及static/animated/video sticker；普通正文保持普通字重；
+- `send`：允许agent发送本地转换为Telegram message entities的Markdown文字，以及static/animated/video sticker；普通正文保持普通字重；可选reaction（限Telegram固定reaction emoji）落在`reply_to`消息上表态，不能替代必须的文字回应；
 - `search`：启用同一个TinyFish工具的有界网页检索与单页读取，需要 `.env` 中由 `tinyfish_key_env` 指定的TinyFish key；
 - `run_js`：启用受限的确定性计算工具；默认关闭，因为模型提供的JavaScript即使经过sandbox仍有残余风险。
 

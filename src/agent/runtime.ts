@@ -929,7 +929,12 @@ export class BotRuntime {
 			recordDuration: (durationMs) => this.recordSendDuration(durationMs),
 		});
 		// Both successful sends and degraded terminal outcomes forbid an automatic resend.
-		this.turnSendOutcome = "outcome" in result.details && result.details.outcome === "unknown" ? "unknown" : "sent";
+		// A reaction-only turn created no message, so a direct address is still owed a reply.
+		if ("outcome" in result.details) {
+			this.turnSendOutcome = result.details.outcome === "unknown" ? "unknown" : "sent";
+		} else if (result.details.sent.length > 0) {
+			this.turnSendOutcome = "sent";
+		}
 		return result;
 	}
 

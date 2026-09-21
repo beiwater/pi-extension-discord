@@ -3,13 +3,13 @@
 
 import { createHash } from "node:crypto";
 
-export const CACHE_SCHEMA_VERSION = 20; // v20: silent direct addresses receive one bounded reply-recovery suffix
+export const CACHE_SCHEMA_VERSION = 21; // v21: send gains an optional reaction bound to reply_to
 
 // Fixed shared protocol is deliberately the first byte of every bot's system prompt so bots in
 // the same provider/cache cohort share the longest possible exact prefix.
 export const TOOL_CAPABILITY_DECLARATION = `## 可用工具
 
-你有三个工具：search（联网搜索，也可读取一个公开网页）、run_js（运行小型计算）、send（唯一的公开发言通道）。被问"能不能搜索/查资料/看网页"时如实说明；需要外部信息时直接用 search。`;
+你有三个工具：search（联网搜索，也可读取一个公开网页）、run_js（运行小型计算）、send（唯一的公开发言通道，也能对某条消息点 reaction 表态）。被问"能不能搜索/查资料/看网页"时如实说明；需要外部信息时直接用 search。`;
 
 export const SHARED_PROTOCOL = `# 群聊协议
 

@@ -10,6 +10,7 @@ export interface SendParams {
 	message?: string;
 	sticker?: string;
 	reply_to?: number;
+	reaction?: string;
 }
 
 export interface SearchParams {
@@ -38,13 +39,13 @@ export const TOOL_DEFS = [
 		name: "send",
 		label: "Send",
 		description:
-			"Telegram 群唯一的公开输出通道。人类 @你、回复你或用配置名称点名时必须公开回应；其他场景可按人设沉默。先完成搜索或计算，再把 Markdown 文字、贴纸和引用合并成唯一一次最终 send 调用，不能拆开发送。message 或 sticker 至少填一个；成功会立即结束本轮，不要再输出或调用工具。普通 Assistant 文本只在本地可见。",
+			"Telegram 群唯一的公开输出通道。人类 @你、回复你或用配置名称点名时必须公开回应，只点 reaction 不算回应；其他场景可按人设沉默，不必回复时可以只用 reaction 表态。先完成搜索或计算，再把 Markdown 文字、贴纸、引用和 reaction 合并成唯一一次最终 send 调用，不能拆开发送。message、sticker 或 reaction 至少填一个；成功会立即结束本轮，不要再输出或调用工具。普通 Assistant 文本只在本地可见。",
 		parameters: Type.Object({
 			message: Type.Optional(
 				Type.String({
 					maxLength: 4096,
 					description:
-						"自然 Markdown 群消息；普通正文不要为了样式包裹整段粗体。支持显式粗体、斜体、删除线、行内/块代码、公共 HTTP(S) 链接、标题、列表、表格和引用；不要使用 HTML 或图片。可与 sticker 和 reply_to 合并；仅发贴纸时省略。",
+						"自然 Markdown 群消息；普通正文不要为了样式包裹整段粗体。支持显式粗体、斜体、删除线、行内/块代码、公共 HTTP(S) 链接、标题、列表、表格和引用；不要使用 HTML 或图片。可与 sticker、reaction 和 reply_to 合并；仅发贴纸或只点 reaction 时省略。",
 				}),
 			),
 			sticker: Type.Optional(
@@ -56,7 +57,14 @@ export const TOOL_DEFS = [
 			reply_to: Type.Optional(
 				Type.Number({
 					description:
-						"直接回应某条消息时填当前可见消息行 # 后的数字 id；不得猜测或使用引用片段中的旧 id。主动发言时省略。",
+						"直接回应某条消息时填当前可见消息行 # 后的数字 id；reaction 也点在这条消息上。不得猜测或使用引用片段中的旧 id。主动发言且不使用 reaction 时省略。",
+				}),
+			),
+			reaction: Type.Optional(
+				Type.String({
+					maxLength: 16,
+					description:
+						"对 reply_to 消息点一个 Telegram reaction 表态（如 👍、❤️、🔥、🤣、🎉），仅限 Telegram 支持的 reaction emoji，其他 emoji 会报错；必须搭配 reply_to。不必回复时单独用它表示态度，也可与 message 合并边回复边表态；被 @、被回复或被点名时不能用它代替必须的文字回应。",
 				}),
 			),
 		}),

@@ -108,7 +108,7 @@ Changing model, media mode, reasoning, cache policy, persona, tools, serializer,
 
 `tools` controls:
 
-- `send`: Markdown text converted locally to Telegram message entities, plus static, animated, and video sticker delivery; ordinary prose keeps ordinary weight;
+- `send`: Markdown text converted locally to Telegram message entities, plus static, animated, and video sticker delivery; ordinary prose keeps ordinary weight; an optional reaction (one of Telegram's fixed reaction emoji) lands on the `reply_to` message as an attitude signal and never replaces an owed reply;
 - `search`: enables bounded TinyFish search and single-page retrieval through one tool; it requires the TinyFish key selected by `tinyfish_key_env` in `.env`;
 - `run_js`: constrained deterministic computation; it is off by default because model-provided JavaScript still has a residual sandbox risk.
 

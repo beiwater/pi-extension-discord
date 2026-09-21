@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { BotApi } from "../telegram/api.ts";
+import { isReactionEmoji } from "../telegram/api.ts";
 import { fileIdForBot } from "../media/local-cache.ts";
 import { log } from "../observability/log.ts";
 import {
@@ -65,13 +66,33 @@ export async function executeAgentSend(params: SendParams, context: AgentSendCon
 }
 
 async function sendAttempt(params: SendParams, context: AgentSendContext) {
-	if (!params.message && !params.sticker) {
+	if (!params.message && !params.sticker && !params.reaction) {
 		log.warn("agent_send", "preflight_failed", {
 			bot_id: context.botId,
 			category: "empty_payload",
 			trigger_message_id: context.triggerMessageId,
 		});
-		throw new Error("send requires at least one of message or sticker");
+		throw new Error("send requires at least one of message, sticker or reaction");
+	}
+	if (params.reaction != null) {
+		if (params.reply_to == null) {
+			log.warn("agent_send", "preflight_failed", {
+				bot_id: context.botId,
+				category: "reaction_without_target",
+				trigger_message_id: context.triggerMessageId,
+			});
+			throw new Error("reaction requires reply_to: the reaction lands on the replied message");
+		}
+		if (!isReactionEmoji(params.reaction)) {
+			log.warn("agent_send", "preflight_failed", {
+				bot_id: context.botId,
+				category: "invalid_reaction_emoji",
+				trigger_message_id: context.triggerMessageId,
+			});
+			throw new Error(
+				`invalid reaction emoji: ${params.reaction} (Telegram accepts only its fixed reaction emoji set, e.g. 👍 ❤️ 🔥 🤣 🎉)`,
+			);
+		}
 	}
 	if (params.reply_to != null && !context.visibleMessageIds.has(params.reply_to)) {
 		log.warn("agent_send", "preflight_failed", {
@@ -87,6 +108,7 @@ async function sendAttempt(params: SendParams, context: AgentSendContext) {
 		bot_id: context.botId,
 		has_message: Boolean(params.message),
 		has_sticker: Boolean(params.sticker),
+		has_reaction: params.reaction != null,
 		has_reply: params.reply_to != null,
 		trigger_message_id: context.triggerMessageId,
 	});
@@ -113,6 +135,7 @@ async function sendAttempt(params: SendParams, context: AgentSendContext) {
 	const sentIds: number[] = [];
 	const failures: SendFailure[] = [];
 	let remoteCommits = 0;
+	let reactedTo: number | null = null;
 	let sendEventAttempted = false;
 	let typingStopAttempted = false;
 
@@ -171,6 +194,8 @@ async function sendAttempt(params: SendParams, context: AgentSendContext) {
 					context.recordEvent("send", {
 						reply_to: params.reply_to ?? null,
 						sticker: params.sticker ?? null,
+						reaction: params.reaction ?? null,
+						reacted_to: reactedTo,
 						sent: sentIds,
 					}),
 				true,
@@ -278,6 +303,39 @@ async function sendAttempt(params: SendParams, context: AgentSendContext) {
 			return await handleCreateFailure("sticker", error);
 		}
 	}
+	// The reaction is best-effort decoration on the replied message: it runs only when every
+	// create component committed cleanly (a degraded path returns above). A failure after a
+	// commit is recorded but never downgrades the delivered message; a reaction-only failure
+	// is thrown back to the model instead — setMessageReaction is idempotent, so retrying it
+	// can never duplicate a message.
+	if (params.reaction && params.reply_to != null) {
+		try {
+			await context.api.setMessageReaction(chatId, params.reply_to, params.reaction);
+			reactedTo = params.reply_to;
+		} catch (error) {
+			if (remoteCommits === 0) {
+				try {
+					context.stopTyping();
+				} catch {
+					// Preserve the actionable reaction error.
+				}
+				throw error;
+			}
+			const category = classifyTelegramCreateFailure(error).category;
+			log.warn("agent_send", "reaction_failed", {
+				bot_id: context.botId,
+				category,
+				target_message_id: params.reply_to,
+				trigger_message_id: context.triggerMessageId,
+			});
+			await runLocalEffect(
+				"message",
+				"event_failed",
+				() => context.recordEvent("reaction_failed", { message_id: params.reply_to, category }),
+				true,
+			);
+		}
+	}
 	sendEventAttempted = true;
 	typingStopAttempted = true;
 	await runLocalEffect(
@@ -287,6 +345,8 @@ async function sendAttempt(params: SendParams, context: AgentSendContext) {
 			context.recordEvent("send", {
 				reply_to: params.reply_to ?? null,
 				sticker: params.sticker ?? null,
+				reaction: params.reaction ?? null,
+				reacted_to: reactedTo,
 				sent: sentIds,
 			}),
 		true,

@@ -14,7 +14,9 @@
 
 ## CACHE_SCHEMA_VERSION
 
-当前：**20**。
+当前：**21**。
+
+v21：send 工具新增可选 `reaction` 参数，经 Bot API `setMessageReaction` 在 `reply_to` 消息上点一个固定枚举内的 reaction emoji（本地白名单 preflight，VS16 规范化），作为不必回复时的表态通道。reaction 不是消息 create：幂等、best-effort——reaction-only 失败直接抛回模型安全重试，已提交消息后的 reaction 失败只记 `reaction_failed` 事件、不降级 send 结果；reaction-only 成功不产生 sent id，因此不算 direct-address 的公开回应（v20 补答与 obligation 语义不变）。send 的 name/description/parameter schema 与共享协议能力声明同步更新（system/tools golden 变化），消息/摘要序列化 grammar 不变。升级会为每个 bot 创建新 epoch，旧 session 文件保留，首次请求冷缓存。
 
 v20：明确寻址但没有公开发送的健康 turn 最多追加一次固定补答 suffix，仍未发送则保留待办。新增补答指令 golden，主聊天 system/tools/消息序列化 hash 不变。
 
@@ -75,6 +77,7 @@ cache-visible protocol 包括：
 - v15：共享协议末尾增加可用工具声明（search / run_js / send 及被问能力时的如实回答规则），修复模型能力自知缺失；trade-off 见上文（per-bot 工具开关与共享 prefix 假设的潜在不一致）。
 - v16：双媒体模式——共享协议占位符行同时覆盖 vision 描述与 context 内联图片，fingerprint 新增 `mediaMode`，details v4 新增 `blocks`；vision 模式 grammar 不变（详见上文）。
 - v17：sticker 占位删 ` set:` 元数据（serializer v4）；目录/候选统一 `s<id>: <emoji> <描述>` 行，set 名与 format 退出模型可见文本，描述纳入 catalog fingerprint；context 模式不再产生 `media_update`（详见上文）。同期修复（非 schema 变更，provider payload 字节不变）：候选块不再焊入持久化 content——v13 把候选移进投影层后，`sendCustomMessage` 的 content 仍携带候选副本，每轮一块累计驻留并被 compaction 原样读入；现持久化 content 为纯消息字节，候选只经投影到达 provider。
+- v21：send 工具新增可选 `reaction` 参数（Telegram `setMessageReaction`，落在 `reply_to` 消息上，固定 reaction emoji 白名单 preflight）；工具 schema 与共享协议能力声明更新（详见上文）。
 
 ## Provider payload 结构
 
@@ -176,12 +179,12 @@ Vision 默认关闭；只有显式 `vision.enabled: true` 才会执行。`auxili
 
 | 项目 | 值 |
 | --- | --- |
-| schema | `20` |
-| zh system | `b2f0432b9b7b` |
-| en system | `231c26fbb95b` |
+| schema | `21` |
+| zh system | `a4c784e00a37` |
+| en system | `b89a39b52e87` |
 | legacy message serializer | `68a17d6e5c05` |
 | immutable event serializer | `4a57de738bf9` |
-| tools | `c28a3db01190` |
+| tools | `98440e1b8d0c` |
 | compaction prompt | `045a5241fdd7` |
 | multimodal compaction envelope | `e2da2b8b68fa` |
 | reply recovery suffix | `4fc7e277e338` |

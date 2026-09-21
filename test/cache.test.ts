@@ -41,12 +41,12 @@ import {
 } from "../src/agent/extensions/index.ts";
 
 const GOLDEN = {
-	schemaVersion: 20,
-	systemZhTemplate: "b2f0432b9b7b",
-	systemEnTemplate: "231c26fbb95b",
+	schemaVersion: 21,
+	systemZhTemplate: "a4c784e00a37",
+	systemEnTemplate: "b89a39b52e87",
 	serialize: "68a17d6e5c05",
 	eventSerialize: "4a57de738bf9",
-	tools: "c28a3db01190",
+	tools: "98440e1b8d0c",
 	compactionPrompt: "045a5241fdd7",
 	multimodalCompaction: "e2da2b8b68fa",
 	replyRecovery: "4fc7e277e338",

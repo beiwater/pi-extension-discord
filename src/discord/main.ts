@@ -177,6 +177,7 @@ async function main(): Promise<void> {
 		dataDir: config.dataDir,
 		routingSecret,
 		personas,
+		webSearchApiKey: env.DEEPSEEK_API_KEY,
 		transport: {
 			sendMessage: async (input) => {
 				const result = await pool.sendMessage({

@@ -11,7 +11,7 @@
 			"personaPath": "personas/luna.md",
 			"provider": "deepseek",
 			"model": "deepseek-flash",
-			"reasoningEffort": "low",
+			"reasoningEffort": "high",
 			"routingP": 0.65
 		}
 	]

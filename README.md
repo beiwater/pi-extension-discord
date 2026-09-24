@@ -30,6 +30,10 @@ bun run pi
 
 > 注意：Pi 的输入框没有密码遮罩，粘贴 token 时请用私密终端，不要录屏。
 
+## Discord 服务器频道
+
+本仓库也提供 Discord 服务器频道入口。配置 bot、限定可用频道并启动的步骤见[Discord 部署指南](docs/discord.md)；Discord 使用独立的 `discord.config.json` 与 `bun run discord:start`。
+
 ## 日常使用
 
 ```bash

@@ -1,0 +1,18 @@
+{
+	"guildId": "000000000000000000",
+	"channelIds": ["000000000000000001"],
+	"dataDir": "data",
+	"routingSecretEnv": "DISCORD_ROUTING_SECRET",
+	"personas": [
+		{
+			"id": "luna",
+			"name": "Luna",
+			"token_env": "DISCORD_LUNA_TOKEN",
+			"personaPath": "personas/luna.md",
+			"provider": "deepseek",
+			"model": "deepseek-flash",
+			"reasoningEffort": "low",
+			"routingP": 0.65
+		}
+	]
+}

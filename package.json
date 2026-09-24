@@ -17,6 +17,8 @@
 		"docs:build": "bun run scripts/docs-site.ts build",
 		"docs:check": "bun run scripts/docs-site.ts check",
 		"start": "bun run src/main.ts start",
+		"discord": "bun run src/discord/main.ts",
+		"discord:start": "bun run src/discord/main.ts",
 		"restart": "bun run src/main.ts restart",
 		"status": "bun run src/main.ts status",
 		"debug": "bun run scripts/debug-report.ts",

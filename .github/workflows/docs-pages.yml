@@ -47,7 +47,8 @@ jobs:
           include-hidden-files: true
 
   deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # GitHub Pages is opt-in because this repository is private and Pages sites are public.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_DOCS_TO_PAGES == 'true'
     needs: build
     runs-on: ubuntu-latest
     permissions:

@@ -13,6 +13,7 @@
 - Bot 可按模型选择发送文字或项目内置的 4 张 PNG 表情图片（hello、laugh、think、hug）；这些是普通图片附件，不是 Discord 服务器贴纸。发图需要 `Attach Files`。
 - Bot 可调用 `react_to_message` 给频道内最近的人类消息点 Discord 表情，作为不发文字的简短回应；需要 `Add Reactions` 权限。
 - 配好 Fish Audio 后，Bot 可调用 `speak` 发送带文字稿的 MP3 语音回复，支持中文、日文和英文。默认只在明确要求语音或短语音特别合适时使用；需要 `Attach Files` 权限。
+- 普通文字回复可使用 Discord 的 Markdown 富文本，包括加粗、斜体、小标题、列表、引用、代码块、链接和剧透标记；提示词要求按内容适度排版。Discord 的 `embeds` 是另一种结构化消息字段，当前入口没有生成它。单条正文最多 2000 字符，长回复由发送端分段；数学公式用纯文本表达。参见 Discord 的 [Markdown 指南](https://support.discord.com/hc/en-us/articles/210298617-Markdown-Text-101-Chat-Formatting-Bold-Italic-Underline)与 [Create Message 文档](https://docs.discord.com/developers/resources/message#create-message)。
 - 提供 `/help`、`/status` 和 `/ask` application commands。暂不提供 Telegram 的 `/compact`、`/set`、管理面板、语音频道或贴纸功能。
 - Discord 消息正文及会话保存在 `data/discord-agent.db` 和 Pi session 文件中；图片缓存在 `data/media`。部署目录只应由受信任的运维账号访问。
 

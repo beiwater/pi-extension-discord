@@ -43,6 +43,14 @@ describe("Discord configuration", () => {
 		).toThrow(/sum/);
 	});
 
+	test("validates optional Fish Audio voice settings", () => {
+		const voice = { apiKeyEnv: "FISH_AUDIO_API_KEY", referenceId: "f88f4a28bb1d4cd7b34bc191b2202eb5" };
+		expect(validateDiscordConfig({ ...base, voice }, "/tmp").voice).toEqual({ ...voice, model: "s2.1-pro-free" });
+		expect(() => validateDiscordConfig({ ...base, voice: { ...voice, referenceId: "invalid" } }, "/tmp")).toThrow(
+			/voice.referenceId/,
+		);
+	});
+
 	test("parses colon-format env without exposing values", () => {
 		const root = mkdtempSync(join(tmpdir(), "discord-config-"));
 		const path = join(root, ".env");

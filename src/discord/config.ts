@@ -7,7 +7,14 @@ export interface DiscordConfig {
 	channelIds: string[];
 	dataDir: string;
 	routingSecretEnv: string;
+	voice?: DiscordConfigVoice;
 	personas: DiscordConfigPersona[];
+}
+
+export interface DiscordConfigVoice {
+	apiKeyEnv: string;
+	referenceId: string;
+	model: "s2.1-pro-free" | "s2.1-pro";
 }
 
 export interface DiscordConfigPersona {
@@ -60,6 +67,23 @@ export function validateDiscordConfig(input: unknown, rootDir: string): DiscordC
 		throw new Error("personas must contain at least one bot");
 	if (typeof value.routingSecretEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(value.routingSecretEnv))
 		throw new Error("routingSecretEnv must name an environment variable");
+	let voice: DiscordConfigVoice | undefined;
+	if (value.voice !== undefined) {
+		if (!value.voice || typeof value.voice !== "object" || Array.isArray(value.voice))
+			throw new Error("voice must be an object");
+		const input = value.voice as Record<string, unknown>;
+		if (typeof input.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(input.apiKeyEnv))
+			throw new Error("voice.apiKeyEnv must name an environment variable");
+		if (typeof input.referenceId !== "string" || !/^[0-9a-f]{32}$/i.test(input.referenceId))
+			throw new Error("voice.referenceId must be a Fish Audio voice id");
+		if (input.model !== undefined && input.model !== "s2.1-pro-free" && input.model !== "s2.1-pro")
+			throw new Error("voice.model must be s2.1-pro-free or s2.1-pro");
+		voice = {
+			apiKeyEnv: input.apiKeyEnv,
+			referenceId: input.referenceId,
+			model: (input.model as DiscordConfigVoice["model"] | undefined) ?? "s2.1-pro-free",
+		};
+	}
 	const seenIds = new Set<string>();
 	let routingTotal = 0;
 	const personas = value.personas.map((entry, index) => {
@@ -107,6 +131,7 @@ export function validateDiscordConfig(input: unknown, rootDir: string): DiscordC
 				? resolve(rootDir, value.dataDir)
 				: resolve(rootDir, "data"),
 		routingSecretEnv: value.routingSecretEnv,
+		...(voice ? { voice } : {}),
 		personas,
 	};
 }
@@ -122,6 +147,8 @@ export function loadDiscordConfig(rootDir = process.cwd()): LoadedDiscordConfig 
 		if (!env[persona.token_env]) throw new Error(`Missing bot token environment variable: ${persona.token_env}`);
 	if (!env[config.routingSecretEnv])
 		throw new Error(`Missing routing secret environment variable: ${config.routingSecretEnv}`);
+	if (config.voice && !env[config.voice.apiKeyEnv])
+		throw new Error(`Missing voice API key environment variable: ${config.voice.apiKeyEnv}`);
 	return { config, rootDir, dataDir: config.dataDir, env };
 }
 

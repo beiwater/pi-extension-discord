@@ -178,6 +178,15 @@ async function main(): Promise<void> {
 		routingSecret,
 		personas,
 		webSearchApiKey: env.DEEPSEEK_API_KEY,
+		...(config.voice
+			? {
+					voice: {
+						apiKey: env[config.voice.apiKeyEnv]!,
+						referenceId: config.voice.referenceId,
+						model: config.voice.model,
+					},
+				}
+			: {}),
 		transport: {
 			sendMessage: async (input) => {
 				const result = await pool.sendMessage({
@@ -191,6 +200,7 @@ async function main(): Promise<void> {
 				return result;
 			},
 			startTyping: (personaId, channelId) => pool.startTyping(personaId, channelId),
+			addReaction: (personaId, channelId, messageId, emoji) => pool.addReaction(personaId, channelId, messageId, emoji),
 		},
 		modelRuntime: runtime,
 	});
@@ -211,7 +221,12 @@ async function main(): Promise<void> {
 		await transport.registerCommands(COMMANDS, config.guildId);
 	}
 	for (const transport of transports.values()) await transport.start();
-	log.info("discord", "ready", { persona_count: personas.length, channel_count: allowed.size });
+	log.info("discord", "ready", {
+		persona_count: personas.length,
+		channel_count: allowed.size,
+		search_enabled: !!env.DEEPSEEK_API_KEY,
+		voice_enabled: !!config.voice,
+	});
 }
 
 main().catch((error) => {

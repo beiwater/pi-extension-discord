@@ -201,6 +201,8 @@ export class DiscordTransport {
 	async addReaction(channelId: Snowflake, messageId: Snowflake, emoji: string): Promise<void> {
 		this.assertSnowflake(channelId, "channelId");
 		this.assertSnowflake(messageId, "messageId");
+		this.assertAllowedChannel(channelId);
+		if (!isValidReactionEmoji(emoji)) throw new Error("invalid reaction emoji");
 		const encoded = encodeURIComponent(emoji);
 		await this.request(`/channels/${channelId}/messages/${messageId}/reactions/${encoded}/@me`, { method: "PUT" });
 	}
@@ -450,6 +452,14 @@ export class DiscordTransport {
 	}
 }
 
+/** Discord accepts a Unicode emoji or a custom emoji written as name:id. */
+export function isValidReactionEmoji(value: unknown): value is string {
+	if (typeof value !== "string" || value.length === 0 || value.length > 64 || value.trim() !== value) return false;
+	if (/^[A-Za-z0-9_]{2,32}:\d{17,20}$/.test(value)) return true;
+	if (/[:\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/u.test(value)) return false;
+	return /\p{Extended_Pictographic}/u.test(value) || /^[\u{1F1E6}-\u{1F1FF}]{2}$/u.test(value);
+}
+
 /** Persona router: each instance owns one bot token and its corresponding identity. */
 export class DiscordTransportPool {
 	constructor(private readonly transports: ReadonlyMap<string, DiscordTransport>) {}
@@ -479,6 +489,10 @@ export class DiscordTransportPool {
 
 	startTyping(personaId: string, channelId: Snowflake): Promise<void> {
 		return this.get(personaId).startTyping(channelId);
+	}
+
+	addReaction(personaId: string, channelId: Snowflake, messageId: Snowflake, emoji: string): Promise<void> {
+		return this.get(personaId).addReaction(channelId, messageId, emoji);
 	}
 
 	private get(personaId: string): DiscordTransport {

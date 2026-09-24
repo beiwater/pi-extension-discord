@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { routeDiscordMessage, type DiscordInboundMessage, type DiscordPersona } from "../src/discord/core.ts";
+import {
+	explicitSearchQuery,
+	explicitVoiceRequest,
+	routeDiscordMessage,
+	type DiscordInboundMessage,
+	type DiscordPersona,
+} from "../src/discord/core.ts";
 
 const personas: DiscordPersona[] = [
 	{
@@ -36,6 +42,21 @@ function message(overrides: Partial<DiscordInboundMessage> = {}): DiscordInbound
 }
 
 describe("Discord conversation routing", () => {
+	test("prefetches an explicit lookup while ignoring a search availability question", () => {
+		expect(explicitSearchQuery("<@1552581470013362197> 你查一下 HSC EAL/D Module D 是什么")).toBe(
+			"你查一下 HSC EAL/D Module D 是什么",
+		);
+		expect(explicitSearchQuery("你查的一下 HSC EALD MODEL D 是什么然后写")).toBe(
+			"你查的一下 HSC EALD MODEL D 是什么然后写",
+		);
+		expect(explicitSearchQuery("为什么还是没有联网搜索？")).toBeNull();
+		expect(explicitSearchQuery("早上好")).toBeNull();
+	});
+	test("recognizes direct voice requests without turning negations into audio", () => {
+		expect(explicitVoiceRequest("菲八，用语音回复我一句你好")).toBe(true);
+		expect(explicitVoiceRequest("Please send a voice reply in Japanese")).toBe(true);
+		expect(explicitVoiceRequest("不用语音回复，打字就行")).toBe(false);
+	});
 	test("routes explicit mentions before other signals", () => {
 		expect(
 			routeDiscordMessage(

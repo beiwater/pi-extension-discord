@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { DiscordTransport, isSnowflake, splitDiscordMessage } from "../src/discord/transport.ts";
+import { DiscordTransport, isSnowflake, isValidReactionEmoji, splitDiscordMessage } from "../src/discord/transport.ts";
 
 describe("Discord transport primitives", () => {
 	test("keeps Discord Snowflakes as strings", () => {
@@ -63,6 +63,35 @@ describe("Discord transport primitives", () => {
 		});
 		expect(calls[1]?.body).toMatchObject({ allowed_mentions: { parse: [], replied_user: false } });
 		await expect(transport.sendMessage("999999999999999999", "nope")).rejects.toThrow("allowlist");
+	});
+
+	test("adds idempotent Discord reactions only in configured channels", async () => {
+		let url = "";
+		let method = "";
+		const transport = new DiscordTransport({
+			token: "test-only",
+			applicationId: "123456789012345678",
+			allowedChannelIds: ["223456789012345678"],
+			fetch: (async (input: string | URL | Request, init?: RequestInit) => {
+				url = String(input);
+				method = init?.method ?? "";
+				return new Response(null, { status: 204 });
+			}) as unknown as typeof fetch,
+		});
+		await transport.addReaction("223456789012345678", "323456789012345678", "👍");
+		expect(method).toBe("PUT");
+		expect(url).toContain("/channels/223456789012345678/messages/323456789012345678/reactions/%F0%9F%91%8D/@me");
+		await expect(transport.addReaction("999999999999999999", "323456789012345678", "👍")).rejects.toThrow("allowlist");
+		await expect(transport.addReaction("223456789012345678", "323456789012345678", "not emoji")).rejects.toThrow(
+			"invalid reaction emoji",
+		);
+	});
+
+	test("accepts bounded Unicode and custom emoji syntax", () => {
+		expect(isValidReactionEmoji("🔥")).toBe(true);
+		expect(isValidReactionEmoji("party_blob:123456789012345678")).toBe(true);
+		expect(isValidReactionEmoji("text")).toBe(false);
+		expect(isValidReactionEmoji("🔥".repeat(33))).toBe(false);
 	});
 
 	test("retries rate limits according to retry_after without exposing response text", async () => {

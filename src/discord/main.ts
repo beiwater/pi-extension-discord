@@ -18,10 +18,23 @@ const COMMANDS = [
 		options: [{ name: "prompt", description: "What would you like to ask?", type: 3, required: true }],
 	},
 ];
+const ADMIN_COMMANDS = [
+	{ name: "context", description: "Show this channel's context usage (bot admin only)" },
+	{ name: "compact", description: "Compact this channel's context (bot admin only)" },
+];
 
-async function normalizeMessage(message: DiscordMessage, guildId: string): Promise<DiscordInboundMessage | null> {
+async function normalizeMessage(
+	message: DiscordMessage,
+	allowedGuilds: ReadonlyMap<string, ReadonlySet<string>>,
+	parentChannelId?: string,
+): Promise<DiscordInboundMessage | null> {
 	const actualGuild = (message as DiscordMessage & { guild_id?: unknown }).guild_id;
-	if (actualGuild !== guildId) return null;
+	const allowedChannels = typeof actualGuild === "string" ? allowedGuilds.get(actualGuild) : undefined;
+	if (
+		!allowedChannels ||
+		!(allowedChannels.has(message.channel_id) || (parentChannelId && allowedChannels.has(parentChannelId)))
+	)
+		return null;
 	const images: NonNullable<DiscordInboundMessage["images"]>[number][] = [];
 	for (const attachment of (message.attachments ?? []).slice(0, 4)) {
 		if (!attachment.content_type?.toLowerCase().startsWith("image/")) continue;
@@ -39,7 +52,7 @@ async function normalizeMessage(message: DiscordMessage, guildId: string): Promi
 	const reply = message.referenced_message;
 	const channelId = message.channel_id;
 	return {
-		guildId,
+		guildId: actualGuild as string,
 		channelId,
 		messageId: message.id,
 		authorId: message.author.id,
@@ -87,8 +100,10 @@ async function main(): Promise<void> {
 		model: persona.model,
 		routingP: persona.routingP,
 		...(persona.reasoningEffort ? { reasoningEffort: persona.reasoningEffort } : {}),
+		...(persona.adminUserIds ? { adminUserIds: persona.adminUserIds } : {}),
 	}));
-	const allowed = new Set(config.channelIds);
+	const allowedGuilds = new Map(config.guilds.map(({ guildId, channelIds }) => [guildId, new Set(channelIds)]));
+	const allowed = new Set(config.guilds.flatMap(({ channelIds }) => channelIds));
 	const transports = new Map<string, DiscordTransport>();
 	const identities = new Map<string, { id: string; username: string }>();
 	let core: DiscordConversationCore | undefined;
@@ -106,17 +121,88 @@ async function main(): Promise<void> {
 				log.error("discord", "transport_error", { persona_id: persona.id, error_category: errorCategory(error) }),
 			onMessage: async (message) => {
 				try {
-					const normalized = await normalizeMessage(message, config.guildId);
+					const normalized = await normalizeMessage(
+						message,
+						allowedGuilds,
+						transport.getParentChannelId(message.channel_id),
+					);
 					if (normalized && core) await core.handleMessage(normalized);
 				} catch (error) {
 					log.error("discord", "message_failed", { persona_id: persona.id, error_category: errorCategory(error) });
 				}
 			},
 			onInteraction: async (interaction) => {
-				if (interaction.guild_id !== config.guildId) return;
+				const interactionGuild =
+					typeof interaction.guild_id === "string" ? allowedGuilds.get(interaction.guild_id) : undefined;
+				if (
+					!interactionGuild ||
+					!interaction.channel_id ||
+					!(
+						interactionGuild.has(interaction.channel_id) ||
+						interactionGuild.has(transport.getParentChannelId(interaction.channel_id) ?? "")
+					)
+				)
+					return;
 				const name = interaction.data?.name;
+				if (name === "context" || name === "compact") {
+					const author = interaction.member?.user ?? interaction.user;
+					if (!author || !persona.adminUserIds?.includes(author.id)) {
+						await transport.respondToInteraction(interaction, "只有菲八管理员可以使用这个命令。", {
+							ephemeral: true,
+						});
+						return;
+					}
+					await transport.deferInteraction(interaction, true);
+					try {
+						if (!core) throw new Error("missing_core");
+						if (name === "context") {
+							const status = await core.getContextStatus(
+								persona.id,
+								interaction.guild_id!,
+								interaction.channel_id,
+								author.id,
+							);
+							await transport.followUpInteraction(
+								interaction,
+								`当前频道上下文：${status.tokens === null ? "暂时无法估算" : `${status.tokens.toLocaleString()} tokens`} / ${status.contextWindow.toLocaleString()} tokens。自动压缩约在 ${status.compactionAtTokens.toLocaleString()} tokens 后触发；也可用 /compact 手动压缩。`,
+								true,
+							);
+						} else {
+							const result = await core.compactContext(
+								persona.id,
+								interaction.guild_id!,
+								interaction.channel_id,
+								author.id,
+							);
+							await transport.followUpInteraction(
+								interaction,
+								`已压缩本频道上下文。压缩前约 ${result.tokensBefore.toLocaleString()} tokens。`,
+								true,
+							);
+						}
+					} catch (error) {
+						log.error("discord", "admin_command_failed", {
+							persona_id: persona.id,
+							error_category: errorCategory(error),
+						});
+						const reason = error instanceof Error ? error.message : "";
+						const content =
+							reason === "context_busy"
+								? "本频道正在处理消息，稍后再试。"
+								: reason === "Already compacted" || reason.startsWith("Nothing to compact")
+									? "本频道目前没有需要压缩的上下文。"
+									: "上下文管理失败，请稍后再试。";
+						await transport.followUpInteraction(interaction, content, true);
+					}
+					return;
+				}
 				if (name === "help") {
-					await transport.respondToInteraction(interaction, "Commands: `/ask prompt`, `/status`, `/help`", {
+					const author = interaction.member?.user ?? interaction.user;
+					const admin = !!author && !!persona.adminUserIds?.includes(author.id);
+					const help = admin
+						? "Commands: `/ask prompt`, `/status`, `/help`, `/context`, `/compact`"
+						: "Commands: `/ask prompt`, `/status`, `/help`";
+					await transport.respondToInteraction(interaction, help, {
 						ephemeral: true,
 					});
 					return;
@@ -137,7 +223,7 @@ async function main(): Promise<void> {
 					const author = interaction.member?.user ?? interaction.user;
 					if (!author || !interaction.channel_id || !core) throw new Error("missing_interaction_context");
 					const dispatch = await core.handleMessage({
-						guildId: config.guildId,
+						guildId: interaction.guild_id!,
 						channelId: interaction.channel_id,
 						messageId: interaction.id,
 						authorId: author.id,
@@ -217,8 +303,9 @@ async function main(): Promise<void> {
 	process.once("SIGTERM", () => void shutdown("SIGTERM").then(() => process.exit(0)));
 
 	for (const [personaId, transport] of transports) {
-		void personaId;
-		await transport.registerCommands(COMMANDS, config.guildId);
+		const persona = config.personas.find((candidate) => candidate.id === personaId)!;
+		const commands = persona.adminUserIds?.length ? [...COMMANDS, ...ADMIN_COMMANDS] : COMMANDS;
+		for (const { guildId } of config.guilds) await transport.registerCommands(commands, guildId);
 	}
 	for (const transport of transports.values()) await transport.start();
 	log.info("discord", "ready", {

@@ -1,6 +1,10 @@
 {
-	"guildId": "000000000000000000",
-	"channelIds": ["000000000000000001"],
+	"guilds": [
+		{
+			"guildId": "000000000000000000",
+			"channelIds": ["000000000000000001"]
+		}
+	],
 	"dataDir": "data",
 	"routingSecretEnv": "DISCORD_ROUTING_SECRET",
 	"personas": [
@@ -12,7 +16,8 @@
 			"provider": "deepseek",
 			"model": "deepseek-flash",
 			"reasoningEffort": "high",
-			"routingP": 0.65
+			"routingP": 0.65,
+			"adminUserIds": []
 		}
 	]
 }

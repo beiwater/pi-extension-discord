@@ -3,8 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { isSnowflake } from "./transport.ts";
 
 export interface DiscordConfig {
-	guildId: string;
-	channelIds: string[];
+	guilds: Array<{ guildId: string; channelIds: string[] }>;
 	dataDir: string;
 	routingSecretEnv: string;
 	voice?: DiscordConfigVoice;
@@ -26,6 +25,7 @@ export interface DiscordConfigPersona {
 	provider: string;
 	model: string;
 	reasoningEffort?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+	adminUserIds?: string[];
 }
 
 export interface LoadedDiscordConfig {
@@ -56,13 +56,24 @@ export function validateDiscordConfig(input: unknown, rootDir: string): DiscordC
 	if (!input || typeof input !== "object" || Array.isArray(input))
 		throw new Error("Discord config must be a JSON object");
 	const value = input as Record<string, unknown>;
-	if (!isSnowflake(value.guildId)) throw new Error("guildId must be a Discord Snowflake string");
-	if (
-		!Array.isArray(value.channelIds) ||
-		value.channelIds.length === 0 ||
-		value.channelIds.some((id) => !isSnowflake(id))
-	)
-		throw new Error("channelIds must be a nonempty array of Discord Snowflake strings");
+	if (!Array.isArray(value.guilds) || value.guilds.length === 0)
+		throw new Error("guilds must contain at least one guild");
+	const seenGuildIds = new Set<string>();
+	const guilds = value.guilds.map((entry, index) => {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry))
+			throw new Error(`guilds[${index}] must be an object`);
+		const guild = entry as Record<string, unknown>;
+		if (!isSnowflake(guild.guildId)) throw new Error(`guilds[${index}].guildId must be a Discord Snowflake string`);
+		if (seenGuildIds.has(guild.guildId)) throw new Error(`Duplicate guild ID: ${guild.guildId}`);
+		seenGuildIds.add(guild.guildId);
+		if (
+			!Array.isArray(guild.channelIds) ||
+			guild.channelIds.length === 0 ||
+			guild.channelIds.some((id) => !isSnowflake(id))
+		)
+			throw new Error(`guilds[${index}].channelIds must be a nonempty array of Discord Snowflake strings`);
+		return { guildId: guild.guildId, channelIds: [...new Set(guild.channelIds as string[])] };
+	});
 	if (!Array.isArray(value.personas) || value.personas.length === 0)
 		throw new Error("personas must contain at least one bot");
 	if (typeof value.routingSecretEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(value.routingSecretEnv))
@@ -111,6 +122,11 @@ export function validateDiscordConfig(input: unknown, rootDir: string): DiscordC
 			!["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(reasoningEffort))
 		)
 			throw new Error(`personas[${index}].reasoningEffort is invalid`);
+		if (
+			persona.adminUserIds !== undefined &&
+			(!Array.isArray(persona.adminUserIds) || persona.adminUserIds.some((id) => !isSnowflake(id)))
+		)
+			throw new Error(`personas[${index}].adminUserIds must be Discord Snowflake strings`);
 		return {
 			id: persona.id as string,
 			name: persona.name as string,
@@ -120,12 +136,12 @@ export function validateDiscordConfig(input: unknown, rootDir: string): DiscordC
 			model: persona.model as string,
 			routingP: persona.routingP,
 			...(reasoningEffort ? { reasoningEffort: reasoningEffort as DiscordConfigPersona["reasoningEffort"] } : {}),
+			...(persona.adminUserIds ? { adminUserIds: [...new Set(persona.adminUserIds as string[])] } : {}),
 		};
 	});
 	if (routingTotal > 1 + Number.EPSILON) throw new Error("The sum of persona routingP values must not exceed 1");
 	return {
-		guildId: value.guildId,
-		channelIds: [...new Set(value.channelIds as string[])],
+		guilds,
 		dataDir:
 			typeof value.dataDir === "string" && value.dataDir.trim()
 				? resolve(rootDir, value.dataDir)

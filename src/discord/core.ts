@@ -30,6 +30,7 @@ export interface DiscordPersona {
 	routingP: number;
 	reasoningEffort?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 	contextWindow?: number;
+	adminUserIds?: readonly string[];
 }
 
 export interface DiscordInboundMessage {
@@ -228,6 +229,37 @@ export class DiscordConversationCore {
 		this.sessions.clear();
 	}
 
+	async getContextStatus(personaId: string, guildId: string, channelId: string, requesterId: string) {
+		const persona = this.requireAdminPersona(personaId, requesterId);
+		return this.runInLane(`${guildId}:${channelId}`, async () => {
+			const session = await this.getSession(persona, guildId, channelId);
+			const usage = session.getContextUsage();
+			const contextWindow = usage?.contextWindow ?? session.model?.contextWindow ?? 0;
+			return {
+				tokens: usage?.tokens ?? null,
+				contextWindow,
+				compactionAtTokens: contextWindow - 16_384,
+			};
+		});
+	}
+
+	async compactContext(personaId: string, guildId: string, channelId: string, requesterId: string) {
+		const persona = this.requireAdminPersona(personaId, requesterId);
+		return this.runInLane(`${guildId}:${channelId}`, async () => {
+			const session = await this.getSession(persona, guildId, channelId);
+			if (!session.isIdle || session.isCompacting) throw new Error("context_busy");
+			const result = await session.compact();
+			return { tokensBefore: result.tokensBefore, estimatedTokensAfter: result.estimatedTokensAfter };
+		});
+	}
+
+	private requireAdminPersona(personaId: string, requesterId: string): DiscordPersona {
+		if (this.closed) throw new Error("discord_core_closed");
+		const persona = this.personas.find((candidate) => candidate.id === personaId);
+		if (!persona || !persona.adminUserIds?.includes(requesterId)) throw new Error("not_persona_admin");
+		return persona;
+	}
+
 	private async processMessage(message: DiscordInboundMessage): Promise<DiscordDispatch> {
 		const insert = this.db.query(`
 			INSERT OR IGNORE INTO discord_core_messages
@@ -250,7 +282,8 @@ export class DiscordConversationCore {
 
 		const route = routeDiscordMessage(message, this.personas, this.secret);
 		const imageRefs = this.persistImages(message);
-		const searchQuery = route.personaId && this.webSearchApiKey ? explicitSearchQuery(message.content) : null;
+		const searchQuery =
+			route.personaId && this.webSearchApiKey ? searchQueryForRoutedMessage(this.db, message, route) : null;
 		const prefetchedSearch = searchQuery ? await runDeepSeekWebSearch(this.webSearchApiKey!, searchQuery) : null;
 		let responseMessageId: string | undefined;
 		for (const persona of this.personas) {
@@ -803,6 +836,40 @@ export function explicitSearchQuery(content: string): string | null {
 	)
 		? text.slice(0, 500)
 		: null;
+}
+
+/** A separate, mention-only follow-up can select a bot for the user's immediately preceding request. */
+export function searchQueryForRoutedMessage(
+	db: Database,
+	message: DiscordInboundMessage,
+	route: DiscordRoute,
+): string | null {
+	const direct = explicitSearchQuery(message.content);
+	if (direct) return direct;
+	if (route.reason !== "explicit" || !/^\s*(?:<@!?\d+>\s*)+$/.test(message.content)) return null;
+	const timestamp = message.timestamp ?? Date.now();
+	const previous = db
+		.query(`
+			SELECT author_id, is_bot, content, timestamp
+			FROM discord_core_messages
+			WHERE guild_id = ? AND channel_id = ? AND message_id != ? AND timestamp <= ?
+			ORDER BY timestamp DESC, message_id DESC
+			LIMIT 1
+		`)
+		.get(message.guildId, message.channelId, message.messageId, timestamp) as {
+		author_id: string;
+		is_bot: number;
+		content: string;
+		timestamp: number;
+	} | null;
+	if (
+		!previous ||
+		previous.author_id !== message.authorId ||
+		previous.is_bot !== 0 ||
+		timestamp - previous.timestamp > 120_000
+	)
+		return null;
+	return explicitSearchQuery(previous.content);
 }
 
 /** An explicit voice request gets audio even if the model chooses a plain-text final answer. */

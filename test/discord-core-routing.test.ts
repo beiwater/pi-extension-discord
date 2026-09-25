@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
+	DiscordConversationCore,
 	explicitSearchQuery,
 	explicitVoiceRequest,
 	routeDiscordMessage,
+	searchQueryForRoutedMessage,
 	type DiscordInboundMessage,
 	type DiscordPersona,
 } from "../src/discord/core.ts";
@@ -51,6 +55,54 @@ describe("Discord conversation routing", () => {
 		);
 		expect(explicitSearchQuery("为什么还是没有联网搜索？")).toBeNull();
 		expect(explicitSearchQuery("早上好")).toBeNull();
+	});
+	test("a separate mention searches the same author's immediately preceding request", () => {
+		const db = new Database(":memory:");
+		db.exec(`
+			CREATE TABLE discord_core_messages (
+				guild_id TEXT, channel_id TEXT, message_id TEXT, author_id TEXT,
+				is_bot INTEGER, content TEXT, timestamp INTEGER
+			)
+		`);
+		const insert = db.query(`
+			INSERT INTO discord_core_messages
+			(guild_id, channel_id, message_id, author_id, is_bot, content, timestamp)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`);
+		const current = message({
+			content: `<@${personas[1]!.userId}>`,
+			mentionedUserIds: [personas[1]!.userId],
+			timestamp: 1_000_011,
+		});
+		const request = "你搜一下2025年的HSCEALD题目，按这个的Model D写完整英文文章";
+		insert.run(current.guildId, current.channelId, "18446744073709551614", current.authorId, 0, request, 1_000_000);
+		const route = routeDiscordMessage(current, personas, "secret");
+		expect(searchQueryForRoutedMessage(db, current, route)).toBe(request);
+
+		insert.run(current.guildId, current.channelId, "18446744073709551613", "44444444444444444", 0, "hi", 1_000_010);
+		expect(searchQueryForRoutedMessage(db, current, route)).toBeNull();
+		insert.run(current.guildId, current.channelId, "18446744073709551612", current.authorId, 0, request, 1_000_010);
+		expect(searchQueryForRoutedMessage(db, { ...current, timestamp: 1_200_011 }, route)).toBeNull();
+		db.close();
+	});
+	test("only a configured persona admin may inspect or compact channel context", async () => {
+		const db = new Database(":memory:");
+		const core = new DiscordConversationCore({
+			db,
+			dataDir: "/unused",
+			routingSecret: "secret",
+			personas: [{ ...personas[1]!, adminUserIds: ["55555555555555555"] }],
+			modelRuntime: {} as ModelRuntime,
+			transport: { sendMessage: async () => ({ id: "12345678901234567" }) },
+		});
+		await expect(
+			core.getContextStatus("mio", "11111111111111111", "22222222222222222", "33333333333333333"),
+		).rejects.toThrow("not_persona_admin");
+		await expect(
+			core.compactContext("mio", "11111111111111111", "22222222222222222", "33333333333333333"),
+		).rejects.toThrow("not_persona_admin");
+		await core.close();
+		db.close();
 	});
 	test("recognizes direct voice requests without turning negations into audio", () => {
 		expect(explicitVoiceRequest("菲八，用语音回复我一句你好")).toBe(true);

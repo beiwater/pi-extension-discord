@@ -124,6 +124,9 @@ export class DiscordTransport {
 	get botIdentity(): { id: Snowflake; username: string } | undefined {
 		return this.readyUser;
 	}
+	getParentChannelId(channelId: Snowflake): Snowflake | undefined {
+		return this.threadParents.get(channelId);
+	}
 
 	async getCurrentUser(): Promise<{ id: Snowflake; username: string }> {
 		const user = await this.request<{ id: unknown; username?: unknown }>("/users/@me");
@@ -258,11 +261,15 @@ export class DiscordTransport {
 		});
 	}
 
-	async followUpInteraction(interaction: DiscordInteraction, content: string): Promise<void> {
+	async followUpInteraction(interaction: DiscordInteraction, content: string, ephemeral = false): Promise<void> {
 		for (const part of splitDiscordMessage(content)) {
 			await this.request(`/webhooks/${interaction.application_id}/${interaction.token}`, {
 				method: "POST",
-				body: JSON.stringify({ content: part, allowed_mentions: DEFAULT_ALLOWED_MENTIONS }),
+				body: JSON.stringify({
+					content: part,
+					...(ephemeral ? { flags: 64 } : {}),
+					allowed_mentions: DEFAULT_ALLOWED_MENTIONS,
+				}),
 			});
 		}
 	}

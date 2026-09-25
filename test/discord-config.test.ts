@@ -5,8 +5,7 @@ import { join } from "node:path";
 import { ensureDeepSeekModelsFile, parseDiscordEnv, validateDiscordConfig } from "../src/discord/config.ts";
 
 const base = {
-	guildId: "1552560014353506386",
-	channelIds: ["1552560015276113962"],
+	guilds: [{ guildId: "1552560014353506386", channelIds: ["1552560015276113962"] }],
 	routingSecretEnv: "DISCORD_ROUTING_SECRET",
 	personas: [
 		{
@@ -24,14 +23,21 @@ const base = {
 describe("Discord configuration", () => {
 	test("keeps Discord Snowflakes as validated strings and resolves local paths", () => {
 		const config = validateDiscordConfig(base, "/private/app");
-		expect(config.guildId).toBe("1552560014353506386");
-		expect(config.channelIds).toEqual(["1552560015276113962"]);
+		expect(config.guilds).toEqual(base.guilds);
 		expect(config.personas[0]?.personaPath).toBe("/private/app/personas/luna.md");
 	});
 
 	test("rejects numeric ids, missing tokens and routing probability over 100%", () => {
-		expect(() => validateDiscordConfig({ ...base, guildId: 123 }, "/tmp")).toThrow(/guildId/);
-		expect(() => validateDiscordConfig({ ...base, channelIds: [123] }, "/tmp")).toThrow(/channelIds/);
+		expect(() => validateDiscordConfig({ ...base, guilds: [{ ...base.guilds[0], guildId: 123 }] }, "/tmp")).toThrow(
+			/guildId/,
+		);
+		expect(() =>
+			validateDiscordConfig({ ...base, guilds: [{ ...base.guilds[0], channelIds: [123] }] }, "/tmp"),
+		).toThrow(/channelIds/);
+		expect(() => validateDiscordConfig({ ...base, guilds: [] }, "/tmp")).toThrow(/guilds/);
+		expect(() => validateDiscordConfig({ ...base, guilds: [base.guilds[0], base.guilds[0]] }, "/tmp")).toThrow(
+			/Duplicate guild/,
+		);
 		expect(() =>
 			validateDiscordConfig({ ...base, personas: [{ ...base.personas[0], routingP: 1.01 }] }, "/tmp"),
 		).toThrow(/routingP/);
@@ -49,6 +55,17 @@ describe("Discord configuration", () => {
 		expect(() => validateDiscordConfig({ ...base, voice: { ...voice, referenceId: "invalid" } }, "/tmp")).toThrow(
 			/voice.referenceId/,
 		);
+	});
+
+	test("limits persona administration to configured Discord user ids", () => {
+		const configured = validateDiscordConfig(
+			{ ...base, personas: [{ ...base.personas[0], adminUserIds: ["55555555555555555"] }] },
+			"/tmp",
+		);
+		expect(configured.personas[0]?.adminUserIds).toEqual(["55555555555555555"]);
+		expect(() =>
+			validateDiscordConfig({ ...base, personas: [{ ...base.personas[0], adminUserIds: [123] }] }, "/tmp"),
+		).toThrow(/adminUserIds/);
 	});
 
 	test("parses colon-format env without exposing values", () => {

@@ -4,8 +4,8 @@
 
 ## 能力与边界
 
-- 多个 persona 可以共用一个服务器，各自保留模型会话；被提及、被回复或按名称点名时优先响应，其余消息按 `routingP` 概率路由。所有 persona 的 `routingP` 总和不能超过 1。
-- 服务器文字频道和该频道下的 thread 可用。每条 persona 的会话按频道/thread 隔离。
+- 多个 persona 可以共用多个服务器，各自保留模型会话；被提及、被回复或按名称点名时优先响应，其余消息按 `routingP` 概率路由。所有 persona 的 `routingP` 总和不能超过 1。
+- 服务器文字频道和该频道下的 thread 可用。每条 persona 的会话按服务器、频道或 thread 隔离，不会把 IDK 与其他服务器的聊天混在一起。
 - 会话持续保存频道上下文；模型可在一轮回答中反复调用工具继续处理。`reasoningEffort` 可设为 `low`、`medium` 或 `high`，提高推理强度会增加延迟和模型费用。
 - 配有 `DEEPSEEK_API_KEY` 时，Bot 可用同一个密钥调用 DeepSeek 的联网搜索，再根据搜索结果回答并附来源链接。明确说「查一下」「搜索」的消息会先搜索，再交给模型回答；其他外部事实也可由模型调用 `search_web`。没有该密钥时不会注册搜索工具；搜索会增加 DeepSeek 的模型用量。
 - Bot 可以调用 `run_js` 做精确计算、单位换算和简单数据处理；它在隔离的短时子进程内运行，不能访问文件、网络或环境变量。
@@ -14,7 +14,7 @@
 - Bot 可调用 `react_to_message` 给频道内最近的人类消息点 Discord 表情，作为不发文字的简短回应；需要 `Add Reactions` 权限。
 - 配好 Fish Audio 后，Bot 可调用 `speak` 发送带文字稿的 MP3 语音回复，支持中文、日文和英文。默认只在明确要求语音或短语音特别合适时使用；需要 `Attach Files` 权限。
 - 普通文字回复可使用 Discord 的 Markdown 富文本，包括加粗、斜体、小标题、列表、引用、代码块、链接和剧透标记；提示词要求按内容适度排版。Discord 的 `embeds` 是另一种结构化消息字段，当前入口没有生成它。单条正文最多 2000 字符，长回复由发送端分段；数学公式用纯文本表达。参见 Discord 的 [Markdown 指南](https://support.discord.com/hc/en-us/articles/210298617-Markdown-Text-101-Chat-Formatting-Bold-Italic-Underline)与 [Create Message 文档](https://docs.discord.com/developers/resources/message#create-message)。
-- 提供 `/help`、`/status` 和 `/ask` application commands。暂不提供 Telegram 的 `/compact`、`/set`、管理面板、语音频道或贴纸功能。
+- 提供 `/help`、`/status` 和 `/ask` application commands。配置 `adminUserIds` 的 persona 另提供 `/context` 和 `/compact`，仅允许列出的 Discord 用户查看当前频道上下文用量或手动压缩；响应只对命令调用者可见。当前默认 DeepSeek 模型上下文窗口为 65,536 tokens，自动压缩在约 49,152 tokens 之后触发。
 - Discord 消息正文及会话保存在 `data/discord-agent.db` 和 Pi session 文件中；图片缓存在 `data/media`。部署目录只应由受信任的运维账号访问。
 
 ## 创建 Discord bot 并安装到服务器
@@ -39,11 +39,10 @@ cp discord.config.example.json discord.config.json
 
 编辑 `discord.config.json`：
 
-- `guildId`：目标服务器 ID。
-- `channelIds`：明确允许 bot 接收和发送消息的频道 ID。建议只加入需要 bot 的频道；thread 使用其父频道的 allowlist。
+- `guilds`：服务器列表；每项包含 `guildId` 和 `channelIds`。为每个服务器填入要启用的频道 ID；thread 使用其父频道的 allowlist。例如可同时配置现有服务器和 Valorant 服务器的 `#化学`、`#物理` 频道。
 - `dataDir`：会话、SQLite 数据库和媒体缓存目录，默认 `data`。
 - `routingSecretEnv`：`.env` 中路由密钥的变量名。
-- `personas`：每个 bot 的唯一 `id`、显示 `name`、token 环境变量名、persona 文件、Pi `provider` / `model`、`reasoningEffort` 与 `routingP`。persona 文件放在项目目录中或填可读路径。
+- `personas`：每个 bot 的唯一 `id`、显示 `name`、token 环境变量名、persona 文件、Pi `provider` / `model`、`reasoningEffort` 与 `routingP`。persona 文件放在项目目录中或填可读路径。可选 `adminUserIds` 是允许使用该 bot 管理命令的 Discord 用户 ID 列表；这不会授予 Discord 服务器 Administrator 权限。
 - `voice`（可选）：Fish Audio 密钥的环境变量名、公开音色的 `referenceId` 与模型。删除此项即禁用语音工具。
 
 Snowflake ID 必须作为 JSON 字符串，例如 `"123456789012345678"`，不能写成 JSON 数字。
@@ -84,7 +83,7 @@ bun install
 bun run discord:start
 ```
 
-启动时会验证配置、bot 身份、Pi 模型和 token，然后注册服务器级 `/help`、`/status`、`/ask` 命令并连接 Discord Gateway。将 bot 在线状态确认后，在 allowlist 频道中提及 bot 或使用 `/ask` 试用；普通消息是否有人设回应由路由概率决定。`routingP: 0` 可让某 persona 只响应明确提及、回复或名称点名。
+启动时会验证配置、bot 身份、Pi 模型和 token，然后为每个配置的服务器注册 `/help`、`/status`、`/ask` 命令；配置了 `adminUserIds` 的 bot 还注册 `/context`、`/compact`，随后连接 Discord Gateway。将 bot 在线状态确认后，在 allowlist 频道中提及 bot 或使用 `/ask` 试用；普通消息是否有人设回应由路由概率决定。`routingP: 0` 可让某 persona 只响应明确提及、回复或名称点名。
 
 Discord Bot 页面若漏开 Message Content Intent，或 bot 没有频道权限，启动或消息响应会失败。日志只输出错误类别，不会显示 token。
 

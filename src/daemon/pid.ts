@@ -69,7 +69,9 @@ function processCwd(pid: number): string | null {
 }
 
 function daemonEntry(args: string[]): string | null {
-	if (basename(args[0] ?? "") !== "bun") return null;
+	// Bun's installed Linux package resolves process.execPath to bun.exe, even when
+	// invoked through the `bun` symlink. Accept both executable basenames.
+	if (!/^bun(?:\.exe)?$/.test(basename(args[0] ?? ""))) return null;
 	// Skip runtime flags (`bun --smol run …`) and the optional `run` subcommand.
 	let runOffset = 1;
 	while (args[runOffset]?.startsWith("-")) runOffset++;

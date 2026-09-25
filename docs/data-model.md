@@ -4,6 +4,8 @@
 
 存储：SQLite（WAL），默认单文件 `data/agent.db`。`messages` 是最新读模型；`message_events` 是 provider-facing 的不可变消费源。
 
+Discord 入口独立运行，使用 `data/discord-agent.db`（SQLite）及 `data/discord-sessions/`，不与 Telegram daemon 的 `data/agent.db` 混用。以下 Discord 记忆表由 Discord 入口初始化。
+
 ## Telegram source 与读模型
 
 ### raw_updates
@@ -106,6 +108,37 @@
 
 - `aliases`：`(chat_id,user_id) → u<N>`，为无 username sender 提供稳定别名。
 - Telegram control 的排除身份存于 `telegram_control_messages`；`agent_events` 只保留可过期的行为审计。
+
+## Discord 成员记忆与庆祝
+
+### discord_memory_profiles
+
+- `(guild_id, user_id)` 主键；每台 Discord 服务器独立保存成员显示名、首次/最近出现时间、消息计数和生日。生日仅从成员明确的自述或本人控制操作录入，不推测。
+- `/memory` 用于本人查看自己的档案，`/birthday` 用于本人设置或清除生日。该表不跨服务器共享。
+
+### discord_memory_facts
+
+- `(guild_id, user_id, fact_key)` 主键，保存有限类别的事实（如偏好、兴趣、角色、项目、时区、语言、目标和备注），并记录来源频道、消息及观察时间；更新同一类别时用新值替换旧值。
+- 当前自动提取范围只包括明确的自我介绍、偏好和生日表达。敏感类别不会作为普通事实接受；记忆片段有条数和长度上限。
+
+### discord_memory_relationships
+
+- `(guild_id, member_a, member_b, relation_type)` 主键，成员 ID 排序后存储；互动关系来自实际提及或回复，朋友/同学等明确关系只在消息直接声明时记录，并累计出现次数、最近来源消息与时间。
+- `/forget` 删除该成员在当前服务器的档案、事实、生日及其关系边，并写入该服务器的 `discord_memory_opt_out`。后续消息不会重新建立档案，直到成员使用 `/memory action:enable`；此操作不影响其他服务器的数据。
+
+### discord_memory_observed_messages / discord_memory_opt_out
+
+- `discord_memory_observed_messages` 以 `(guild_id, channel_id, message_id)` 去重，确保消息重放不会重复增加互动计数。
+- `discord_memory_opt_out` 按 `(guild_id, user_id)` 保存忘记/退出状态。记忆查询与生日列表都会排除退出成员。
+
+### discord_celebration_deliveries
+
+- `(guild_id, channel_id, persona_id, local_date, event_key)` 唯一标识一次本地日历事件的发送；状态为 `sending` 或 `sent`，成功后记发送时间。完成记录跨重启保留以抑制重复消息；明确发送失败会释放 claim。同一当地日的 `sending` 超过 30 分钟后允许重试，防止重启漏发；若 Discord 已收消息而进程尚未记成功，极端情况下可能重复一次。过期日期不会补发。
+- 自动发送只针对 `discord.config.json` 中显式列出的 `celebrations` 频道；配置校验要求该频道属于对应 guild 的 allowlist，并要求指定已配置 persona、IANA 时区和节日日历。生日每名成员单独一条，仅允许提及本人；节日每个事件/目标最多一条，不解析全体提及。
+
+### Discord soul 文件
+
+- persona 自身的正式 `soul.md` 位于 `data/discord-souls/<persona-id>/soul.md`，新的短笔记先写同目录 `soul.pending.md`。两者不在 SQLite 内，也不与成员档案混存。更新工具只允许当前配置 persona 暂存笔记；成功压缩上下文后才合并进正式文件并清除 pending。正式文件限 4 KiB、pending 限 1 KiB，拒绝明显的密钥、成员隐私与提示注入内容；文件私有、原子替换，正式文件更新前留一个 `soul.md.bak`。
 
 ## Retention 与安全删除
 

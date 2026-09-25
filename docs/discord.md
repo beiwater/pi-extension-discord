@@ -14,7 +14,10 @@
 - Bot 可调用 `react_to_message` 给频道内最近的人类消息点 Discord 表情，作为不发文字的简短回应；需要 `Add Reactions` 权限。
 - 配好 Fish Audio 后，Bot 可调用 `speak` 发送带文字稿的 MP3 语音回复，支持中文、日文和英文。默认只在明确要求语音或短语音特别合适时使用；需要 `Attach Files` 权限。
 - 普通文字回复可使用 Discord 的 Markdown 富文本，包括加粗、斜体、小标题、列表、引用、代码块、链接和剧透标记；提示词要求按内容适度排版。Discord 的 `embeds` 是另一种结构化消息字段，当前入口没有生成它。单条正文最多 2000 字符，长回复由发送端分段；数学公式用纯文本表达。参见 Discord 的 [Markdown 指南](https://support.discord.com/hc/en-us/articles/210298617-Markdown-Text-101-Chat-Formatting-Bold-Italic-Underline)与 [Create Message 文档](https://docs.discord.com/developers/resources/message#create-message)。
-- 提供 `/help`、`/status` 和 `/ask` application commands。配置 `adminUserIds` 的 persona 另提供 `/context` 和 `/compact`，仅允许列出的 Discord 用户查看当前频道上下文用量或手动压缩；响应只对命令调用者可见。当前默认 DeepSeek 模型上下文窗口为 65,536 tokens，自动压缩在约 49,152 tokens 之后触发。
+- 提供 `/help`、`/status`、`/ask`、`/memory`、`/birthday` 和 `/forget` application commands。配置 `adminUserIds` 的 persona 另提供 `/context` 和 `/compact`，仅允许列出的 Discord 用户查看当前频道上下文用量或手动压缩；管理和记忆命令响应只对调用者可见。当前默认 DeepSeek 模型上下文窗口为 65,536 tokens，自动压缩在约 49,152 tokens 之后触发。
+- 每个 Discord 服务器分别维护成员档案、明确表达的偏好与关系记录；Bot 会从成员在群内明确说出的生日/姓名/偏好及实际提及、回复等互动更新档案，不把猜测当事实。跨服务器不会共享成员记忆。成员可用 `/memory` 查看自己的档案、`/birthday` 设置或清除生日、`/forget` 删除本服务器的结构化档案和关系并停止继续记录；忘记后需由成员使用 `/memory action:enable` 才恢复记录。`/forget` 不会删除 Discord 原消息或已有 Pi 会话历史。
+- persona 可通过私人 soul 更新工具提交新的风格与自我反思。新笔记先私有暂存并在会话尾部生效；下次成功压缩上下文后才合入正式 `soul.md` 并重载系统提示词。笔记不保存成员隐私，受长度和敏感信息检查，旧正式版本保存在私有备份中。
+- 生日提醒与节日祝福默认关闭。只有在 `celebrations` 中为服务器显式配置一个允许频道后，才会在该频道当地时间 09:00 后发送；生日祝福单独 @ 当事人，节日祝福不 @ 全体。时区使用 IANA 名称，节日历可选中国、澳洲或两者。当前中国节日覆盖元旦、春节、劳动节、端午节、中秋节、国庆节；澳洲节日覆盖元旦、Australia Day、Good Friday、Easter Sunday、ANZAC Day、圣诞节与 Boxing Day。2 月 29 日生日在平年于 2 月 28 日祝福；州别补假、调休不在本日历内。
 - Discord 消息正文及会话保存在 `data/discord-agent.db` 和 Pi session 文件中；图片缓存在 `data/media`。部署目录只应由受信任的运维账号访问。
 
 ## 创建 Discord bot 并安装到服务器
@@ -43,7 +46,24 @@ cp discord.config.example.json discord.config.json
 - `dataDir`：会话、SQLite 数据库和媒体缓存目录，默认 `data`。
 - `routingSecretEnv`：`.env` 中路由密钥的变量名。
 - `personas`：每个 bot 的唯一 `id`、显示 `name`、token 环境变量名、persona 文件、Pi `provider` / `model`、`reasoningEffort` 与 `routingP`。persona 文件放在项目目录中或填可读路径。可选 `adminUserIds` 是允许使用该 bot 管理命令的 Discord 用户 ID 列表；这不会授予 Discord 服务器 Administrator 权限。
+- `celebrations`（可选）：显式启用自动生日提醒和节日祝福的目标列表。每项指定 `guildId`、`channelId`、`personaId`、IANA `timeZone` 和 `calendar`（`china`、`australia` 或 `both`）；目标频道必须同时出现在该服务器 `channelIds` allowlist 中。省略该字段或设为空数组即关闭自动发送。配置示例使用虚构 ID，部署时应替换为自己的服务器和频道 ID。
 - `voice`（可选）：Fish Audio 密钥的环境变量名、公开音色的 `referenceId` 与模型。删除此项即禁用语音工具。
+
+例如，显式为配置服务器的一个允许频道开启悉尼时区的中澳节日历：
+
+```json
+"celebrations": [
+	{
+		"guildId": "000000000000000000",
+		"channelId": "000000000000000001",
+		"personaId": "luna",
+		"timeZone": "Australia/Sydney",
+		"calendar": "both"
+	}
+]
+```
+
+仅将生日告诉 Bot 不会让它向任意频道发送消息；自动祝福只使用这里明确配置的频道。`/birthday` 可登记或清除自己的生日，`/memory` 可查看自己的记录，`/forget` 可删除本服务器记忆并停止收集；生日与档案均按 Discord 服务器隔离。
 
 Snowflake ID 必须作为 JSON 字符串，例如 `"123456789012345678"`，不能写成 JSON 数字。
 
@@ -83,7 +103,7 @@ bun install
 bun run discord:start
 ```
 
-启动时会验证配置、bot 身份、Pi 模型和 token，然后为每个配置的服务器注册 `/help`、`/status`、`/ask` 命令；配置了 `adminUserIds` 的 bot 还注册 `/context`、`/compact`，随后连接 Discord Gateway。将 bot 在线状态确认后，在 allowlist 频道中提及 bot 或使用 `/ask` 试用；普通消息是否有人设回应由路由概率决定。`routingP: 0` 可让某 persona 只响应明确提及、回复或名称点名。
+启动时会验证配置、bot 身份、Pi 模型和 token，然后为每个配置的服务器注册 `/help`、`/status`、`/ask`、`/memory`、`/birthday`、`/forget` 命令；配置了 `adminUserIds` 的 bot 还注册 `/context`、`/compact`，随后连接 Discord Gateway。将 bot 在线状态确认后，在 allowlist 频道中提及 bot 或使用 `/ask` 试用；普通消息是否有人设回应由路由概率决定。`routingP: 0` 可让某 persona 只响应明确提及、回复或名称点名。
 
 Discord Bot 页面若漏开 Message Content Intent，或 bot 没有频道权限，启动或消息响应会失败。日志只输出错误类别，不会显示 token。
 
@@ -140,4 +160,4 @@ bun run check
 bun run test
 ```
 
-然后在指定频道核验三种路径：提及 bot、回复 bot、`/ask`。再确认 allowlist 外频道不会触发 bot、图片附件可作为模型输入、bot 回声不会引发自我回复，以及 systemd 重启后会话仍可恢复。
+然后在指定频道核验三种路径：提及 bot、回复 bot、`/ask`。再确认 allowlist 外频道不会触发 bot、图片附件可作为模型输入、bot 回声不会引发自我回复，以及 systemd 重启后会话仍可恢复。启用了 `celebrations` 时，检查目标频道、时区及生日名单，并确认未配置的频道不会收到自动消息。

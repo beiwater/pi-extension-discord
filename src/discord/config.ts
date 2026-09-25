@@ -7,7 +7,16 @@ export interface DiscordConfig {
 	dataDir: string;
 	routingSecretEnv: string;
 	voice?: DiscordConfigVoice;
+	celebrations?: DiscordCelebrationTarget[];
 	personas: DiscordConfigPersona[];
+}
+
+export interface DiscordCelebrationTarget {
+	guildId: string;
+	channelId: string;
+	personaId: string;
+	timeZone: string;
+	calendar: "china" | "australia" | "both";
 }
 
 export interface DiscordConfigVoice {
@@ -140,8 +149,43 @@ export function validateDiscordConfig(input: unknown, rootDir: string): DiscordC
 		};
 	});
 	if (routingTotal > 1 + Number.EPSILON) throw new Error("The sum of persona routingP values must not exceed 1");
+	let celebrations: DiscordCelebrationTarget[] | undefined;
+	if (value.celebrations !== undefined) {
+		if (!Array.isArray(value.celebrations)) throw new Error("celebrations must be an array");
+		const seenTargets = new Set<string>();
+		celebrations = value.celebrations.map((entry, index) => {
+			if (!entry || typeof entry !== "object" || Array.isArray(entry))
+				throw new Error(`celebrations[${index}] must be an object`);
+			const target = entry as Record<string, unknown>;
+			const guild = guilds.find((candidate) => candidate.guildId === target.guildId);
+			if (!guild || !guild.channelIds.includes(String(target.channelId)))
+				throw new Error(`celebrations[${index}] must use an allowed guild channel`);
+			if (!personas.some((candidate) => candidate.id === target.personaId))
+				throw new Error(`celebrations[${index}].personaId must name a configured persona`);
+			if (typeof target.timeZone !== "string")
+				throw new Error(`celebrations[${index}].timeZone must be an IANA time zone`);
+			try {
+				new Intl.DateTimeFormat("en", { timeZone: target.timeZone });
+			} catch {
+				throw new Error(`celebrations[${index}].timeZone must be an IANA time zone`);
+			}
+			if (target.calendar !== "china" && target.calendar !== "australia" && target.calendar !== "both")
+				throw new Error(`celebrations[${index}].calendar is invalid`);
+			const key = `${target.guildId}:${target.channelId}`;
+			if (seenTargets.has(key)) throw new Error(`Duplicate celebration target: ${key}`);
+			seenTargets.add(key);
+			return {
+				guildId: target.guildId as string,
+				channelId: target.channelId as string,
+				personaId: target.personaId as string,
+				timeZone: target.timeZone,
+				calendar: target.calendar,
+			};
+		});
+	}
 	return {
 		guilds,
+		...(celebrations ? { celebrations } : {}),
 		dataDir:
 			typeof value.dataDir === "string" && value.dataDir.trim()
 				? resolve(rootDir, value.dataDir)

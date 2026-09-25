@@ -68,6 +68,23 @@ describe("Discord configuration", () => {
 		).toThrow(/adminUserIds/);
 	});
 
+	test("celebration targets stay inside configured channels with a valid time zone", () => {
+		const target = {
+			guildId: base.guilds[0].guildId,
+			channelId: base.guilds[0].channelIds[0],
+			personaId: "luna",
+			timeZone: "Australia/Sydney",
+			calendar: "both",
+		} as const;
+		expect(validateDiscordConfig({ ...base, celebrations: [target] }, "/tmp").celebrations).toEqual([target]);
+		expect(() =>
+			validateDiscordConfig({ ...base, celebrations: [{ ...target, channelId: "55555555555555555" }] }, "/tmp"),
+		).toThrow(/allowed guild channel/);
+		expect(() =>
+			validateDiscordConfig({ ...base, celebrations: [{ ...target, timeZone: "Mars/Olympus" }] }, "/tmp"),
+		).toThrow(/IANA time zone/);
+	});
+
 	test("parses colon-format env without exposing values", () => {
 		const root = mkdtempSync(join(tmpdir(), "discord-config-"));
 		const path = join(root, ".env");

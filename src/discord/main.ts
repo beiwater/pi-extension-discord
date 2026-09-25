@@ -6,6 +6,9 @@ import { log, errorCategory } from "../observability/log.ts";
 import { downloadDiscordImage, prepareDiscordImageForPi } from "./media.ts";
 import type { DiscordInboundMessage, DiscordPersona } from "./core.ts";
 import { DiscordConversationCore } from "./core.ts";
+import { DiscordMemberMemory } from "./memory.ts";
+import { DiscordSoulStore } from "./soul.ts";
+import { DiscordCelebrationScheduler } from "./celebrations.ts";
 import { loadDiscordConfig, ensureDeepSeekModelsFile } from "./config.ts";
 import { DiscordTransport, DiscordTransportPool, type DiscordInteraction, type DiscordMessage } from "./transport.ts";
 
@@ -17,6 +20,28 @@ const COMMANDS = [
 		description: "Ask the assistants",
 		options: [{ name: "prompt", description: "What would you like to ask?", type: 3, required: true }],
 	},
+	{
+		name: "memory",
+		description: "View or re-enable your own server memory",
+		options: [
+			{
+				name: "action",
+				description: "show or enable",
+				type: 3,
+				required: false,
+				choices: [
+					{ name: "Show", value: "show" },
+					{ name: "Enable", value: "enable" },
+				],
+			},
+		],
+	},
+	{
+		name: "birthday",
+		description: "View, set, or clear your own birthday reminder",
+		options: [{ name: "date", description: "MM-DD, or clear; leave empty to view", type: 3, required: false }],
+	},
+	{ name: "forget", description: "Delete your server memory and stop collecting it" },
 ];
 const ADMIN_COMMANDS = [
 	{ name: "context", description: "Show this channel's context usage (bot admin only)" },
@@ -107,6 +132,7 @@ async function main(): Promise<void> {
 	const transports = new Map<string, DiscordTransport>();
 	const identities = new Map<string, { id: string; username: string }>();
 	let core: DiscordConversationCore | undefined;
+	let memberMemory: DiscordMemberMemory | undefined;
 	for (const persona of config.personas) {
 		const token = tokenByPersona.get(persona.id)!;
 		const probe = new DiscordTransport({ token, applicationId: "10000000000000001" });
@@ -144,6 +170,98 @@ async function main(): Promise<void> {
 				)
 					return;
 				const name = interaction.data?.name;
+				if (name === "memory" || name === "birthday" || name === "forget") {
+					const author = interaction.member?.user ?? interaction.user;
+					if (!author || !memberMemory || !interaction.guild_id) return;
+					try {
+						if (name === "forget") {
+							memberMemory.forgetMember(interaction.guild_id, author.id);
+							await transport.respondToInteraction(
+								interaction,
+								"已删除你在这个服务器的长期档案和关系记录，并停止继续建立档案。频道原有聊天记录仍按服务器现有设置保存。",
+								{ ephemeral: true },
+							);
+							return;
+						}
+						if (name === "memory") {
+							if (getOption(interaction, "action") === "enable") {
+								memberMemory.enableMember(interaction.guild_id, author.id);
+								await transport.respondToInteraction(
+									interaction,
+									"已重新启用你在这个服务器的长期记忆。今后的消息会建立新档案。",
+									{ ephemeral: true },
+								);
+								return;
+							}
+							const profile = memberMemory.getProfile(interaction.guild_id, author.id);
+							const details = profile
+								? [
+										`名称：${profile.name}`,
+										`已记录消息：${profile.messageCount}`,
+										`生日：${profile.birthday ? `${profile.birthday.month}月${profile.birthday.day}日` : "未记录"}`,
+										...profile.facts.slice(0, 6).map((fact) => `${fact.key}：${fact.value}`),
+										...profile.relationships.slice(0, 5).map((relation) => `${relation.type}：${relation.name}`),
+									]
+										.join("\n")
+										.slice(0, 1800)
+								: "这个服务器里暂无你的长期档案，或者你已关闭记忆。可用 `/memory action:enable` 重新启用。";
+							await transport.respondToInteraction(interaction, details, { ephemeral: true });
+							return;
+						}
+						const date = getOption(interaction, "date")?.trim();
+						if (!date) {
+							const birthday = memberMemory.getProfile(interaction.guild_id, author.id)?.birthday;
+							await transport.respondToInteraction(
+								interaction,
+								birthday
+									? `已记录生日：${birthday.month}月${birthday.day}日。`
+									: "还没有记录生日。使用 `/birthday date:MM-DD` 设置。",
+								{ ephemeral: true },
+							);
+							return;
+						}
+						if (date.toLowerCase() === "clear") {
+							memberMemory.clearBirthday(interaction.guild_id, author.id);
+							await transport.respondToInteraction(interaction, "已清除生日提醒。", { ephemeral: true });
+							return;
+						}
+						const match = /^(\d{1,2})-(\d{1,2})$/.exec(date);
+						if (!match) {
+							await transport.respondToInteraction(interaction, "请输入 MM-DD，例如 09-25；或输入 clear 清除。", {
+								ephemeral: true,
+							});
+							return;
+						}
+						const month = Number(match[1]);
+						const day = Number(match[2]);
+						memberMemory.setBirthday(
+							interaction.guild_id,
+							author.id,
+							month,
+							day,
+							interaction.channel_id,
+							interaction.id,
+						);
+						const celebrationChannel = config.celebrations?.find(
+							(target) => target.guildId === interaction.guild_id,
+						)?.channelId;
+						await transport.respondToInteraction(
+							interaction,
+							`已在这个服务器记录你的生日：${month}月${day}日。${celebrationChannel ? `到时会在 <#${celebrationChannel}> 祝福。` : "这个服务器尚未启用自动生日祝福。"}`,
+							{ ephemeral: true },
+						);
+					} catch (error) {
+						log.error("discord", "memory_command_failed", { error_category: errorCategory(error) });
+						await transport.respondToInteraction(
+							interaction,
+							error instanceof Error && error.message === "memory_opted_out"
+								? "你已关闭长期记忆。若要重新保存生日，请先使用 `/memory action:enable`。"
+								: "记忆操作失败；请检查日期是否有效，或稍后重试。",
+							{ ephemeral: true },
+						);
+					}
+					return;
+				}
 				if (name === "context" || name === "compact") {
 					const author = interaction.member?.user ?? interaction.user;
 					if (!author || !persona.adminUserIds?.includes(author.id)) {
@@ -200,8 +318,8 @@ async function main(): Promise<void> {
 					const author = interaction.member?.user ?? interaction.user;
 					const admin = !!author && !!persona.adminUserIds?.includes(author.id);
 					const help = admin
-						? "Commands: `/ask prompt`, `/status`, `/help`, `/context`, `/compact`"
-						: "Commands: `/ask prompt`, `/status`, `/help`";
+						? "Commands: `/ask`, `/status`, `/memory`, `/birthday`, `/forget`, `/context`, `/compact`"
+						: "Commands: `/ask`, `/status`, `/memory`, `/birthday`, `/forget`";
 					await transport.respondToInteraction(interaction, help, {
 						ephemeral: true,
 					});
@@ -258,11 +376,18 @@ async function main(): Promise<void> {
 	mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
 	const db = new Database(dbPath);
 	chmodSync(dbPath, 0o600);
+	memberMemory = new DiscordMemberMemory(db);
+	const soulStore = new DiscordSoulStore({
+		dataDir: config.dataDir,
+		personaIds: personas.map((persona) => persona.id),
+	});
 	core = new DiscordConversationCore({
 		db,
 		dataDir: config.dataDir,
 		routingSecret,
 		personas,
+		memberMemory,
+		soulStore,
 		webSearchApiKey: env.DEEPSEEK_API_KEY,
 		...(config.voice
 			? {
@@ -290,11 +415,21 @@ async function main(): Promise<void> {
 		},
 		modelRuntime: runtime,
 	});
+	const scheduler = new DiscordCelebrationScheduler({
+		db,
+		targets: config.celebrations ?? [],
+		listBirthdays: (guildId, month, day) => memberMemory!.listBirthdays(guildId, month, day),
+		onError: (error) => log.error("discord", "celebration_failed", { error_category: errorCategory(error) }),
+		send: async (personaId, channelId, content, allowedMentions) => {
+			await pool.sendMessage({ personaId, channelId, content, allowedMentions });
+		},
+	});
 	let shuttingDown = false;
 	const shutdown = async (signal: string) => {
 		if (shuttingDown) return;
 		shuttingDown = true;
 		log.info("discord", "shutdown", { signal });
+		await scheduler.stop();
 		await Promise.allSettled([...transports.values()].map((transport) => transport.stop()));
 		await core.close();
 		db.close();
@@ -308,11 +443,13 @@ async function main(): Promise<void> {
 		for (const { guildId } of config.guilds) await transport.registerCommands(commands, guildId);
 	}
 	for (const transport of transports.values()) await transport.start();
+	scheduler.start();
 	log.info("discord", "ready", {
 		persona_count: personas.length,
 		channel_count: allowed.size,
 		search_enabled: !!env.DEEPSEEK_API_KEY,
 		voice_enabled: !!config.voice,
+		celebration_targets: config.celebrations?.length ?? 0,
 	});
 }
 

@@ -173,6 +173,14 @@ Vision 默认关闭；只有显式 `vision.enabled: true` 才会执行。`auxili
 
 2026-08-07 的 50-run DeepSeek 数据按当前统一公式 `R / (↑ + R + W)`（该样本 `W=0`）测得 90.0% cache hit。该数字仅是历史 deployment 样本，不代表当前 schema 版本、其他模型或未来负载；完整字段口径见 `docs/telemetry.md`。
 
+## Discord / 菲八的前缀缓存
+
+Discord 入口使用独立的 Pi session（按 persona、服务器、频道或 thread），不经过上文 Telegram 的 `CACHE_SCHEMA_VERSION` fingerprint。Discord 的工具或系统提示词形状升级后，首次请求可能因新前缀重新计费；不应为 Discord 改动重置 Telegram 的 session epoch。
+
+- 成员档案在 SQLite 按服务器维护。模型仅在当前问题确实需要个性化、人物关系或生日资料时调用 `recall_member_memory`；每轮最多三次、只读同服务器近期可见成员且每条结果有长度上限。工具调用与结果由 Pi 正常写入会话尾部，下一轮保留相同前缀。成员资料不再每轮通过 `context` 事件短暂注入又消失。
+- 正式 `soul.md` 只在创建会话或成功压缩后重载时进入系统提示词。`update_soul` 先写私有 `soul.pending.md`；临时设定作为有界的会话尾部消息生效，每个 session 对同一待合并内容至多追加一次。成功压缩后合入正式文件，`AgentSession.reload()` 重读资源并重建系统提示词，同时保留 Pi 已写入的压缩摘要和近期消息。原生压缩本身是有损摘要，较旧的推理和工具记录会按 Pi 的保留切点归入摘要；本扩展不额外过滤它们。
+- `discord.cache_usage` 结构化日志只记录每轮 assistant 调用数以及 `inputTokens`、`cacheReadTokens`、`cacheWriteTokens`、`outputTokens`，不记正文、提示词或工具参数。实际命中率按 `cacheRead / (input + cacheRead + cacheWrite)` 计算；一次压缩或系统提示词重载后的首轮与稳态分开看。Pi 的私有 session JSONL 也保留同样的 assistant usage 字段，供部署前后同模型对比。
+
 ## Golden
 
 `test/cache.test.ts` 当前锁定：

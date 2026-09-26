@@ -124,6 +124,10 @@ async function main(): Promise<void> {
 		provider: persona.provider,
 		model: persona.model,
 		routingP: persona.routingP,
+		sendReactionImages: persona.sendReactionImages,
+		voiceEnabled: persona.voiceEnabled,
+		guildIds: persona.guildIds,
+		aliases: persona.aliases,
 		...(persona.reasoningEffort ? { reasoningEffort: persona.reasoningEffort } : {}),
 		...(persona.adminUserIds ? { adminUserIds: persona.adminUserIds } : {}),
 	}));
@@ -135,6 +139,11 @@ async function main(): Promise<void> {
 	let memberMemory: DiscordMemberMemory | undefined;
 	for (const persona of config.personas) {
 		const token = tokenByPersona.get(persona.id)!;
+		const personaAllowed = new Set(
+			config.guilds
+				.filter(({ guildId }) => !persona.guildIds || persona.guildIds.includes(guildId))
+				.flatMap(({ channelIds }) => channelIds),
+		);
 		const probe = new DiscordTransport({ token, applicationId: "10000000000000001" });
 		const identity = await probe.getCurrentUser();
 		identities.set(persona.id, identity);
@@ -142,7 +151,7 @@ async function main(): Promise<void> {
 		transport = new DiscordTransport({
 			token,
 			applicationId: identity.id,
-			allowedChannelIds: allowed,
+			allowedChannelIds: personaAllowed,
 			onError: (error) =>
 				log.error("discord", "transport_error", { persona_id: persona.id, error_category: errorCategory(error) }),
 			onMessage: async (message) => {
@@ -162,6 +171,7 @@ async function main(): Promise<void> {
 					typeof interaction.guild_id === "string" ? allowedGuilds.get(interaction.guild_id) : undefined;
 				if (
 					!interactionGuild ||
+					(persona.guildIds && !persona.guildIds.includes(interaction.guild_id!)) ||
 					!interaction.channel_id ||
 					!(
 						interactionGuild.has(interaction.channel_id) ||
@@ -440,7 +450,9 @@ async function main(): Promise<void> {
 	for (const [personaId, transport] of transports) {
 		const persona = config.personas.find((candidate) => candidate.id === personaId)!;
 		const commands = persona.adminUserIds?.length ? [...COMMANDS, ...ADMIN_COMMANDS] : COMMANDS;
-		for (const { guildId } of config.guilds) await transport.registerCommands(commands, guildId);
+		for (const { guildId } of config.guilds) {
+			if (!persona.guildIds || persona.guildIds.includes(guildId)) await transport.registerCommands(commands, guildId);
+		}
 	}
 	for (const transport of transports.values()) await transport.start();
 	scheduler.start();

@@ -45,7 +45,7 @@ cp discord.config.example.json discord.config.json
 - `guilds`：服务器列表；每项包含 `guildId` 和 `channelIds`。为每个服务器填入要启用的频道 ID；thread 使用其父频道的 allowlist。例如可同时配置现有服务器和 Valorant 服务器的 `#化学`、`#物理` 频道。
 - `dataDir`：会话、SQLite 数据库和媒体缓存目录，默认 `data`。
 - `routingSecretEnv`：`.env` 中路由密钥的变量名。
-- `personas`：每个 bot 的唯一 `id`、显示 `name`、token 环境变量名、persona 文件、Pi `provider` / `model`、`reasoningEffort` 与 `routingP`。persona 文件放在项目目录中或填可读路径。可选 `adminUserIds` 是允许使用该 bot 管理命令的 Discord 用户 ID 列表；这不会授予 Discord 服务器 Administrator 权限。
+- `personas`：每个 bot 的唯一 `id`、显示 `name`、token 环境变量名、persona 文件、Pi `provider` / `model`、`reasoningEffort` 与 `routingP`。persona 文件放在项目目录中或填可读路径。可选 `adminUserIds` 是允许使用该 bot 管理命令的 Discord 用户 ID 列表；这不会授予 Discord 服务器 Administrator 权限。`guildIds` 可将某个 persona 限定在配置过的服务器子集；省略时沿用全部 `guilds`。`aliases` 添加额外的名称点名词。`sendReactionImages` 和 `voiceEnabled` 分别控制该 persona 是否能发 reaction 图片、是否使用全局 Fish Audio 音色；默认均为 `true`，设为 `false` 会同时移除对应工具和提示词。
 - `celebrations`（可选）：显式启用自动生日提醒和节日祝福的目标列表。每项指定 `guildId`、`channelId`、`personaId`、IANA `timeZone` 和 `calendar`（`china`、`australia` 或 `both`）；目标频道必须同时出现在该服务器 `channelIds` allowlist 中。省略该字段或设为空数组即关闭自动发送。配置示例使用虚构 ID，部署时应替换为自己的服务器和频道 ID。
 - `voice`（可选）：Fish Audio 密钥的环境变量名、公开音色的 `referenceId` 与模型。删除此项即禁用语音工具。
 

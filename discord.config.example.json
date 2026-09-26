@@ -26,6 +26,9 @@
 			"model": "deepseek-flash",
 			"reasoningEffort": "high",
 			"routingP": 0.65,
+			"sendReactionImages": true,
+			"voiceEnabled": true,
+			"aliases": [],
 			"adminUserIds": []
 		}
 	]

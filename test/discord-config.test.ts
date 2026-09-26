@@ -25,6 +25,41 @@ describe("Discord configuration", () => {
 		const config = validateDiscordConfig(base, "/private/app");
 		expect(config.guilds).toEqual(base.guilds);
 		expect(config.personas[0]?.personaPath).toBe("/private/app/personas/luna.md");
+		expect(config.personas[0]).toMatchObject({ sendReactionImages: true, voiceEnabled: true, aliases: [] });
+		expect(config.personas[0]?.guildIds).toBeUndefined();
+	});
+
+	test("supports persona-specific image, voice, guild, and alias settings", () => {
+		const configured = validateDiscordConfig(
+			{
+				...base,
+				personas: [
+					{
+						...base.personas[0],
+						sendReactionImages: false,
+						voiceEnabled: false,
+						guildIds: [base.guilds[0]!.guildId],
+						aliases: ["Stanley", " Stanley Xu "],
+					},
+				],
+			},
+			"/private/app",
+		);
+		expect(configured.personas[0]).toMatchObject({
+			sendReactionImages: false,
+			voiceEnabled: false,
+			guildIds: [base.guilds[0]!.guildId],
+			aliases: ["Stanley", "Stanley Xu"],
+		});
+		expect(() =>
+			validateDiscordConfig({ ...base, personas: [{ ...base.personas[0], sendReactionImages: "false" }] }, "/tmp"),
+		).toThrow(/sendReactionImages/);
+		expect(() =>
+			validateDiscordConfig({ ...base, personas: [{ ...base.personas[0], guildIds: ["55555555555555555"] }] }, "/tmp"),
+		).toThrow(/configured guilds/);
+		expect(() =>
+			validateDiscordConfig({ ...base, personas: [{ ...base.personas[0], aliases: [""] }] }, "/tmp"),
+		).toThrow(/aliases/);
 	});
 
 	test("rejects numeric ids, missing tokens and routing probability over 100%", () => {

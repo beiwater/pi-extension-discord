@@ -33,6 +33,10 @@ export interface DiscordConfigPersona {
 	routingP: number;
 	provider: string;
 	model: string;
+	sendReactionImages: boolean;
+	voiceEnabled: boolean;
+	guildIds?: string[];
+	aliases: string[];
 	reasoningEffort?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 	adminUserIds?: string[];
 }
@@ -136,6 +140,24 @@ export function validateDiscordConfig(input: unknown, rootDir: string): DiscordC
 			(!Array.isArray(persona.adminUserIds) || persona.adminUserIds.some((id) => !isSnowflake(id)))
 		)
 			throw new Error(`personas[${index}].adminUserIds must be Discord Snowflake strings`);
+		if (persona.sendReactionImages !== undefined && typeof persona.sendReactionImages !== "boolean")
+			throw new Error(`personas[${index}].sendReactionImages must be a boolean`);
+		if (persona.voiceEnabled !== undefined && typeof persona.voiceEnabled !== "boolean")
+			throw new Error(`personas[${index}].voiceEnabled must be a boolean`);
+		let guildIds: string[] | undefined;
+		if (persona.guildIds !== undefined) {
+			if (!Array.isArray(persona.guildIds) || persona.guildIds.some((id) => !isSnowflake(id)))
+				throw new Error(`personas[${index}].guildIds must be Discord Snowflake strings`);
+			if (persona.guildIds.some((id) => !guilds.some((guild) => guild.guildId === id)))
+				throw new Error(`personas[${index}].guildIds must be configured guilds`);
+			guildIds = [...new Set(persona.guildIds as string[])];
+		}
+		if (
+			persona.aliases !== undefined &&
+			(!Array.isArray(persona.aliases) ||
+				persona.aliases.some((alias) => typeof alias !== "string" || !alias.trim() || alias.trim().length > 64))
+		)
+			throw new Error(`personas[${index}].aliases must be nonempty strings up to 64 characters`);
 		return {
 			id: persona.id as string,
 			name: persona.name as string,
@@ -144,6 +166,10 @@ export function validateDiscordConfig(input: unknown, rootDir: string): DiscordC
 			provider: persona.provider as string,
 			model: persona.model as string,
 			routingP: persona.routingP,
+			sendReactionImages: persona.sendReactionImages !== false,
+			voiceEnabled: persona.voiceEnabled !== false,
+			...(guildIds ? { guildIds } : {}),
+			aliases: [...new Set(((persona.aliases ?? []) as string[]).map((alias) => alias.trim()))],
 			...(reasoningEffort ? { reasoningEffort: reasoningEffort as DiscordConfigPersona["reasoningEffort"] } : {}),
 			...(persona.adminUserIds ? { adminUserIds: [...new Set(persona.adminUserIds as string[])] } : {}),
 		};

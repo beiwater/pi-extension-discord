@@ -46,6 +46,27 @@ function message(overrides: Partial<DiscordInboundMessage> = {}): DiscordInbound
 }
 
 describe("Discord conversation routing", () => {
+	test("routes names and aliases only within each persona's configured guilds", () => {
+		const stanley: DiscordPersona = {
+			...personas[0]!,
+			id: "shize",
+			name: "许诗泽",
+			aliases: ["Stanley", "Stanley Xu"],
+			guildIds: ["11111111111111111"],
+			routingP: 0,
+		};
+		expect(routeDiscordMessage(message({ content: "Stanley 在吗" }), [stanley], "secret")).toEqual({
+			personaId: "shize",
+			reason: "name",
+		});
+		expect(
+			routeDiscordMessage(message({ guildId: "44444444444444444", content: "Stanley 在吗" }), [stanley], "secret"),
+		).toEqual({
+			personaId: null,
+			reason: "nobody",
+		});
+	});
+
 	test("prefetches an explicit lookup while ignoring a search availability question", () => {
 		expect(explicitSearchQuery("<@1552581470013362197> 你查一下 HSC EAL/D Module D 是什么")).toBe(
 			"你查一下 HSC EAL/D Module D 是什么",
